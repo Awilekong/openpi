@@ -999,7 +999,7 @@ _CONFIGS = [
         ),
         data=LeRobotFrankaDataConfig(
             # Replace with your Franka LeRobot dataset repo id
-            repo_id="franka/peg_in_hole",
+            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
             base_config=DataConfig(
                 # Load prompt from the task field in LeRobot dataset
                 prompt_from_task=True,
@@ -1028,7 +1028,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="franka/peg_in_hole",
+            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
@@ -1049,7 +1049,7 @@ _CONFIGS = [
             max_token_len=180,  # Sufficient for single-arm robot
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="franka/peg_in_hole",
+            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
@@ -1066,7 +1066,7 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="franka/peg_in_hole",
+            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
@@ -1087,10 +1087,10 @@ _CONFIGS = [
             discrete_state_input=False,
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="franka/peg_in_hole_ee_pose_delta",
+            repo_id="/root/code/zpw/data/peg_in_hole_ee_pose_delta",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/code/zpw/data/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
