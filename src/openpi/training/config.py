@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.franka_policy as franka_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -450,6 +451,71 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaDataConfig(DataConfigFactory):
+    """
+    Data config for Franka single-arm robot dataset in LeRobot format.
+    
+    This config is used to configure transforms for Franka robot data with:
+    - State: 7-dim [ee_x, ee_y, ee_z, ee_rot_x, ee_rot_y, ee_rot_z, gripper]
+    - Action: 7-dim EE pose delta (same as state)
+    - Images: 3 cameras (main_realsense, side_realsense, handeye_realsense)
+    """
+    
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment.
+        # Below, we match the keys in the Franka LeRobot dataset to the keys used in the policy.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/state": "observation.state",
+                        "observation/images/main_realsense_rgb": "observation.images.main_realsense_rgb",
+                        "observation/images/side_realsense_rgb": "observation.images.side_realsense_rgb",
+                        "observation/images/handeye_realsense_rgb": "observation.images.handeye_realsense_rgb",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # We defined these transforms in `franka_policy.py`.
+        data_transforms = _transforms.Group(
+            inputs=[franka_policy.FrankaInputs(model_type=model_config.model_type)],
+            outputs=[franka_policy.FrankaOutputs()],
+        )
+
+        # For Franka robot, the actions in the dataset are already delta actions (EE pose delta),
+        # so we do *not* need to apply an additional delta conversion.
+        # If your Franka dataset uses absolute actions, uncomment the following lines:
+        # delta_action_mask = _transforms.make_bool_mask(6, -1)  # Apply delta to first 6 (pose), keep gripper absolute
+        # data_transforms = data_transforms.push(
+        #     inputs=[_transforms.DeltaActions(delta_action_mask)],
+        #     outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        # )
+
+        # Model transforms include things like tokenizing the prompt and action targets.
+        # You do not need to change anything here.
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        # We return all data transforms for training and inference.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -920,6 +986,124 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # Franka configs. Fine-tuning configs for Franka single-arm robot.
+    #
+    TrainConfig(
+        # Fine-tuning pi0 on Franka dataset (full finetuning)
+        name="pi0_franka",
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # Pad to 32 dims for model compatibility
+            action_horizon=10,  # Action chunk length
+        ),
+        data=LeRobotFrankaDataConfig(
+            # Replace with your Franka LeRobot dataset repo id
+            repo_id="franka/peg_in_hole",
+            base_config=DataConfig(
+                # Load prompt from the task field in LeRobot dataset
+                prompt_from_task=True,
+            ),
+            # Optionally set a default prompt if your dataset doesn't have task field
+            # default_prompt="insert the peg into the hole",
+        ),
+        # Load the pi0 base model checkpoint for initialization
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+    ),
+    TrainConfig(
+        # Fine-tuning pi0 on Franka dataset (LoRA low-memory finetuning)
+        name="pi0_franka_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotFrankaDataConfig(
+            repo_id="franka/peg_in_hole",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # Fine-tuning pi0-FAST on Franka dataset
+        name="pi0_fast_franka",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,  # Franka has 7-dim actions
+            action_horizon=10,
+            max_token_len=180,  # Sufficient for single-arm robot
+        ),
+        data=LeRobotFrankaDataConfig(
+            repo_id="franka/peg_in_hole",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # Fine-tuning pi0-FAST on Franka dataset (LoRA)
+        name="pi0_fast_franka_low_mem_finetune",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotFrankaDataConfig(
+            repo_id="franka/peg_in_hole",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # Fine-tuning pi05 on Franka dataset
+        name="pi05_franka",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 uses 32-dim actions
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotFrankaDataConfig(
+            repo_id="franka/peg_in_hole_ee_pose_delta",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            # Scale warmup steps linearly with batch size: 10k @256 -> 2.5k @64
+            warmup_steps=2_500,
+            # Linear LR scaling from official pi05 (5e-5 @256) -> 1.25e-5 @64
+            peak_lr=1.25e-5,
+            # Use long decay horizon to approximate constant LR like official
+            decay_steps=1_000_000,
+            decay_lr=1.25e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
     ),
     #
     # Debugging configs.
