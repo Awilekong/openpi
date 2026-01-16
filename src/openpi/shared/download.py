@@ -59,17 +59,17 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
     local_path = cache_dir / parsed.netloc / parsed.path.strip("/")
     local_path = local_path.resolve()
 
-    # Check if the cache should be invalidated.
-    invalidate_cache = False
-    if local_path.exists():
-        if force_download or _should_invalidate_cache(cache_dir, local_path):
-            invalidate_cache = True
-        else:
-            return local_path
-
     try:
         lock_path = local_path.with_suffix(".lock")
         with filelock.FileLock(lock_path):
+            # Check if the cache should be invalidated.
+            invalidate_cache = False
+            if local_path.exists():
+                if force_download or _should_invalidate_cache(cache_dir, local_path):
+                    invalidate_cache = True
+                else:
+                    return local_path
+
             # Ensure consistent permissions for the lock file.
             _ensure_permissions(lock_path)
             # First, remove the existing cache if it is expired.
@@ -84,6 +84,14 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
             logger.info(f"Downloading {url} to {local_path}")
             scratch_path = local_path.with_suffix(".partial")
             _download_fsspec(url, scratch_path, **kwargs)
+
+            # If the destination exists (created by another process while we were downloading?),
+            # remove it to avoid nesting.
+            if local_path.exists():
+                 if local_path.is_dir():
+                    shutil.rmtree(local_path)
+                 else:
+                    local_path.unlink()
 
             shutil.move(scratch_path, local_path)
             _ensure_permissions(local_path)

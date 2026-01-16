@@ -1000,93 +1000,6 @@ _CONFIGS = [
     # Franka configs. Fine-tuning configs for Franka single-arm robot.
     #
     TrainConfig(
-        # Fine-tuning pi0 on Franka dataset (full finetuning)
-        name="pi0_franka",
-        model=pi0_config.Pi0Config(
-            action_dim=32,  # Pad to 32 dims for model compatibility
-            action_horizon=10,  # Action chunk length
-        ),
-        data=LeRobotFrankaDataConfig(
-            # Replace with your Franka LeRobot dataset repo id
-            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
-            base_config=DataConfig(
-                # Load prompt from the task field in LeRobot dataset
-                prompt_from_task=True,
-            ),
-            # Optionally set a default prompt if your dataset doesn't have task field
-            # default_prompt="insert the peg into the hole",
-        ),
-        # Load the pi0 base model checkpoint for initialization
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=5e-6,
-        ),
-    ),
-    TrainConfig(
-        # Fine-tuning pi0 on Franka dataset (LoRA low-memory finetuning)
-        name="pi0_franka_low_mem_finetune",
-        model=pi0_config.Pi0Config(
-            action_dim=32,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotFrankaDataConfig(
-            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
-    TrainConfig(
-        # Fine-tuning pi0-FAST on Franka dataset
-        name="pi0_fast_franka",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=7,  # Franka has 7-dim actions
-            action_horizon=10,
-            max_token_len=180,  # Sufficient for single-arm robot
-        ),
-        data=LeRobotFrankaDataConfig(
-            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-    ),
-    TrainConfig(
-        # Fine-tuning pi0-FAST on Franka dataset (LoRA)
-        name="pi0_fast_franka_low_mem_finetune",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=7,
-            action_horizon=10,
-            max_token_len=180,
-            paligemma_variant="gemma_2b_lora",
-        ),
-        data=LeRobotFrankaDataConfig(
-            repo_id="/mlp_vepfs/share/zpw/data/peg_in_hole_ee_pose_delta",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    TrainConfig(
         # Fine-tuning pi05 on Franka dataset
         name="pi05_franka",
         model=pi0_config.Pi0Config(
@@ -1096,23 +1009,10 @@ _CONFIGS = [
             discrete_state_input=False,
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="/root/code/zpw/data/peg_in_hole_ee_pose_delta",
+            repo_id="/home/dataset-local/data/megvii_post/franka/peg_in_hole_merged_ee_pose_delta",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/root/code/zpw/data/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=64,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            # Scale warmup steps linearly with batch size: 10k @256 -> 2.5k @64
-            warmup_steps=2_500,
-            # Linear LR scaling from official pi05 (5e-5 @256) -> 1.25e-5 @64
-            peak_lr=1.25e-5,
-            # Use long decay horizon to approximate constant LR like official
-            decay_steps=1_000_000,
-            decay_lr=1.25e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
     ),
     #
     # Debugging configs.
