@@ -73,6 +73,40 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class Pi0ResTacWeightLoader(WeightLoader):
+    """Loads weights from a checkpoint for ResTacVLA model.
+
+    Loads base Pi0/Pi05 weights and preserves new tactile-related parameters:
+    - tactile_encoder, tactile_proj: Tactile encoding modules
+    - gate (FactorizedGate): Factorized gate network (sigma_threshold, sigma_temperature, mod_mlp, mod_out)
+    - stage1_cross_attn, stage2_cross_attn: Two-stage cross-attention modules
+    - time_mlp (Pi05): Time MLP for adaRMS conditioning
+    - lora: LoRA adaptation weights
+
+    Compatible with:
+      trained checkpoints:
+        example: "./checkpoints/<config>/<exp>/<step>/params"
+      released checkpoints:
+        example: "gs://openpi-assets/checkpoints/<model>/params"
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        # Load base checkpoint
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path),
+            restore_type=np.ndarray
+        )
+        # Preserve new tactile-related modules, time_mlp (Pi05), and LoRA weights
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=".*lora.*|.*tactile.*|.*gate.*|.*stage.*cross_attn.*|.*time_mlp.*"
+        )
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 

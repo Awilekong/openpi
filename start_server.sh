@@ -1,1 +1,1 @@
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_franka --policy.dir=/home/dataset-local/code/openpi/checkpoints/pi05_franka/plug_peg/39999

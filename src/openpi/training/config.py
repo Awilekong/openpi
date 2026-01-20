@@ -16,11 +16,13 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_restac as pi0_restac
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.franka_policy as franka_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.restac_policy as restac_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -353,6 +355,64 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotResTacDataConfig(DataConfigFactory):
+    """
+    Data configuration for ResTacVLA model.
+    Handles visual observations + tactile image input.
+    """
+
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+    # Key for tactile image in the dataset
+    tactile_key: str = "observation.tactile_image"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform: map dataset keys to expected keys
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "image": "observation.image",
+                        "wrist_image": "observation.wrist_image",
+                        "tactile_image": self.tactile_key,
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Data transforms: use ResTac-specific transforms
+        data_transforms = _transforms.Group(
+            inputs=[restac_policy.ResTacInputs(
+                action_dim=model_config.action_dim,
+                model_type=model_config.model_type
+            )],
+            outputs=[restac_policy.ResTacOutputs()],
+        )
+
+        # Delta action transform for first 6 dimensions (joints), absolute for gripper
+        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms (tokenization, etc.)
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -1005,14 +1065,58 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,  # pi05 uses 32-dim actions
-            action_horizon=10,
+            action_horizon=50,
             discrete_state_input=False,
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="/home/dataset-local/data/megvii_post/franka/peg_in_hole_merged_ee_pose_delta",
+            repo_id="/home/dataset-local/data/megvii_post/franka/plug_the_charger_into_the_power_strip",
+            # repo_id="/home/dataset-local/data/megvii_post/franka/pull_out_the_center_peg_and_plug_it_into_the_side",
+            # repo_id="/home/dataset-local/data/megvii_post/franka/wipe_the_pen_marks_off_the_plate",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/dataset-local/cache/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps = 40_000
+    ),
+    #
+    # ResTacVLA configs (Pi05-based tactile fusion).
+    #
+    TrainConfig(
+        name="pi05_restac",
+        model=pi0_restac.Pi0_ResTacConfig(
+            fusion_dim=512,
+            num_cross_attn_heads=8,
+            sparse_loss_weight=0.01,
+        ),
+        data=LeRobotResTacDataConfig(
+            repo_id="your_tactile_dataset",  # TODO: Replace with actual dataset
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.Pi0ResTacWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=4,
+    ),
+    # LoRA fine-tuning version (low memory)
+    TrainConfig(
+        name="pi05_restac_lora",
+        model=pi0_restac.Pi0_ResTacConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            fusion_dim=512,
+            num_cross_attn_heads=8,
+            sparse_loss_weight=0.01,
+        ),
+        data=LeRobotResTacDataConfig(
+            repo_id="your_tactile_dataset",  # TODO: Replace with actual dataset
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.Pi0ResTacWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_restac.Pi0_ResTacConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
     ),
     #
     # Debugging configs.
