@@ -1069,9 +1069,10 @@ _CONFIGS = [
             discrete_state_input=False,
         ),
         data=LeRobotFrankaDataConfig(
-            repo_id="/home/dataset-local/data/megvii_post/franka/plug_the_charger_into_the_power_strip",
+            # repo_id="/home/dataset-local/data/megvii_post/franka/plug_the_charger_into_the_power_strip",
             # repo_id="/home/dataset-local/data/megvii_post/franka/pull_out_the_center_peg_and_plug_it_into_the_side",
             # repo_id="/home/dataset-local/data/megvii_post/franka/wipe_the_pen_marks_off_the_plate",
+            repo_id="/home/dataset-local/data/megvii_post/franka/peg_in_hole_merged_ee_pose_delta",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/home/dataset-local/cache/openpi-assets/checkpoints/pi05_base/params"),
