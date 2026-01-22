@@ -138,11 +138,18 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+
+    # Create delta_timestamps for action horizon
+    # For ResTacVLA, we also need to include state_prev (one timestep in the past)
+    delta_timestamps_dict = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+
+    # action_prev is already computed and stored in the dataset during conversion,
+    # so we don't need to add state_prev here
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps_dict,
     )
 
     if data_config.prompt_from_task:

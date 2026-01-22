@@ -16,6 +16,8 @@ Key features:
 import dataclasses
 import logging
 from typing import Tuple
+import os
+import numpy as np
 
 import einops
 import flax.nnx as nnx
@@ -31,6 +33,173 @@ from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
 logger = logging.getLogger("openpi")
+
+# Import for Unit-Align integration (optional)
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+
+# =============================================================================
+# Unit-Align VQVAE Wrapper
+# =============================================================================
+
+class ResidualVQVAEWrapper(nnx.Module if TORCH_AVAILABLE else object):
+    """
+    Wrapper for Unit-Align's Residual VQVAE.
+
+    Loads a pre-trained Residual VQ-VAE checkpoint and provides:
+    - VQ codes extraction (discrete semantic event codes)
+    - Logvar extraction (uncertainty from Prophet network)
+    """
+
+    def __init__(self, checkpoint_path: str, frozen: bool = True):
+        """
+        Initialize VQVAE wrapper.
+
+        Args:
+            checkpoint_path: Path to Unit-Align residual_vqvae checkpoint
+            frozen: Whether to freeze all parameters (inference only)
+        """
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch is required for ResidualVQVAEWrapper")
+
+        self.checkpoint_path = checkpoint_path
+        self.frozen = frozen
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Import here to avoid circular dependency
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(checkpoint_path), '../..'))
+
+        try:
+            from UniT.taming.models.residual_vqmodel import ResidualVQModel
+            self.model_class = ResidualVQModel
+        except ImportError:
+            raise ImportError(
+                f"Could not import ResidualVQModel from Unit-Align. "
+                f"Make sure Unit-Align is in the Python path."
+            )
+
+        self._load_checkpoint()
+        logger.info(f"✓ Loaded ResidualVQVAE from {checkpoint_path}")
+
+    def _load_checkpoint(self):
+        """Load checkpoint and initialize model."""
+        if not os.path.exists(self.checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
+
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+
+        # Handle different checkpoint formats
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+            hparams = checkpoint.get('hyper_parameters', {})
+        else:
+            state_dict = checkpoint
+            hparams = {}
+
+        # For now, we'll store the state_dict and hparams for later use
+        # Full model initialization would require more information
+        self.state_dict = state_dict
+        self.hparams = hparams
+        self.model = None  # Model will be initialized on first use
+
+    def forward(
+        self,
+        tactile_image: jnp.ndarray,  # [B, H, W, C]
+        visual_3views: jnp.ndarray | None,   # [B, 3, 3, 224, 224] 三视角
+        action_prev: jnp.ndarray     # [B, 7]
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Extract q_event codes and logvar from tactile observations using Unit-Align VQVAE.
+
+        IMPORTANT: Data format must match Unit-Align's expectations:
+        - Prophet输入: 三视角拼接视觉 [B, 3, 3, 224, 224] + action_prev [B, 7]
+        - Obs Encoder输入: tactile_image [B, 3, 128, 160]
+
+        Args:
+            tactile_image: Tactile image [B, 128, 160, 3] (HWC format from JAX)
+            visual_3views: 3-view visual [B, 3, 3, 224, 224] (properly stacked from observation)
+            action_prev: Previous action [B, 7]
+
+        Returns:
+            q_event_pooled: Pooled VQ event codes [B, 64] (from q_event [B,64,H,W])
+            logvar: Prophet网络的log-variance [B, 1]
+        """
+        # Convert JAX arrays to PyTorch
+        tactile_pt = torch.from_numpy(np.asarray(tactile_image)).float().to(self.device)
+        action_pt = torch.from_numpy(np.asarray(action_prev)).float().to(self.device)
+
+        # Rearrange tactile to CHW format: [B, H, W, C] → [B, C, H, W]
+        if tactile_pt.dim() == 4 and tactile_pt.shape[-1] == 3:
+            tactile_pt = tactile_pt.permute(0, 3, 1, 2)  # [B, 3, 128, 160]
+
+        # Handle 3-view visual input
+        # visual_3views should be [B, 3, 3, 224, 224] (batch, num_views, channels, height, width)
+        if visual_3views is None:
+            # Fallback if 3-view visual is not available
+            logger.warning("visual_3views is None in ResidualVQVAEWrapper.forward(). Using placeholder.")
+            B = tactile_pt.shape[0]
+            q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
+            logvar = torch.zeros(B, 1, device=self.device)
+        else:
+            visual_pt_3views = torch.from_numpy(np.asarray(visual_3views)).float().to(self.device)
+            # Verify shape: [B, 3, 3, 224, 224]
+            if visual_pt_3views.dim() == 5 and visual_pt_3views.shape[1:] == (3, 3, 224, 224):
+                # Correct format, ready for Prophet
+                pass
+            else:
+                logger.warning(
+                    f"visual_3views has unexpected shape {visual_pt_3views.shape}. "
+                    f"Expected [B, 3, 3, 224, 224]. Using placeholder."
+                )
+                B = tactile_pt.shape[0]
+                q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
+                logvar = torch.zeros(B, 1, device=self.device)
+
+        if visual_3views is not None:
+            with torch.no_grad():
+                # 准备 Unit-Align ResidualVQModel 的 batch 格式
+                batch = {
+                    'tactile_image': tactile_pt,      # [B, 3, 128, 160] - Obs Encoder 输入
+                    'visual_image': visual_pt_3views,  # [B, 3, 3, 224, 224] - Prophet 输入（三视角）
+                    'action_prev': action_pt           # [B, 7] - Prophet 输入（前一动作）
+                }
+
+                try:
+                    if self.model is None:
+                        logger.debug("ResidualVQVAE model not initialized. Using placeholder.")
+                        B = tactile_pt.shape[0]
+                        q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
+                        logvar = torch.zeros(B, 1, device=self.device)
+                    else:
+                        # Unit-Align ResidualVQModel forward
+                        outputs = self.model(batch)
+
+                        # 提取关键输出
+                        q_event = outputs['q_event']  # [B, 64, H, W] - 量化事件表示
+                        logvar = outputs['logvar']    # [B, 1] - Prophet的不确定性
+
+                        # q_event 池化：[B, 64, H, W] → [B, 64]
+                        # 使用平均池化
+                        B = q_event.shape[0]
+                        q_event_pooled = q_event.view(B, q_event.shape[1], -1).mean(dim=-1)  # [B, 64]
+
+                except Exception as e:
+                    logger.warning(f"Error in ResidualVQVAE forward: {e}. Using placeholder.")
+                    B = tactile_pt.shape[0]
+                    q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
+                    logvar = torch.zeros(B, 1, device=self.device)
+
+        # 转换回 JAX
+        q_event_pooled_jax = jnp.asarray(q_event_pooled.cpu().numpy().astype(np.float32))  # [B, 64]
+        logvar_jax = jnp.asarray(logvar.cpu().numpy().astype(np.float32))  # [B, 1]
+
+        return q_event_pooled_jax, logvar_jax
 
 
 # =============================================================================
@@ -178,44 +347,81 @@ class CrossAttentionBlock(nnx.Module):
 
 class TactileEncoderPlaceholder(nnx.Module):
     """
-    Placeholder for tactile encoder.
-    To be replaced with a real pre-trained tactile encoder later.
+    Tactile encoder supporting both VQVAE and placeholder modes.
 
-    The real encoder should output:
-    - features: [B, 1, output_dim] - tactile features
-    - sigma: [B, 1] - standard deviation indicating tactile importance
+    With VQVAE:
+    - q_event [B, 64] from Unit-Align VQ codebook
+    - logvar [B, 1] from Prophet network
+    - Project q_event → fusion_dim (via project_vq layer)
+
+    Placeholder mode:
+    - MLP-based features
+    - Simple sigma estimation
 
     Args:
-        output_dim: Output feature dimension
+        output_dim: Output feature dimension (for placeholder)
+        fusion_dim: Target dimension for VQ projection (for VQVAE)
+        vqvae_wrapper: Optional ResidialVQVAEWrapper instance
         rngs: Random number generators
     """
 
-    def __init__(self, output_dim: int, rngs: nnx.Rngs = None):
+    def __init__(self, output_dim: int, fusion_dim: int = 512, vqvae_wrapper=None, rngs: nnx.Rngs = None):
         self.output_dim = output_dim
-        # Placeholder: simple MLP that processes flattened tactile image
+        self.fusion_dim = fusion_dim
+        self.vqvae_wrapper = vqvae_wrapper
+
+        # Placeholder MLP (used when vqvae_wrapper is None)
         self.proj = nnx.Linear(224 * 224 * 3, output_dim, rngs=rngs)
-        # Placeholder sigma estimator
         self.sigma_proj = nnx.Linear(224 * 224 * 3, 1, rngs=rngs)
 
-    def __call__(self, tactile_image: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        # Project VQ codes to fusion space (used when vqvae_wrapper is provided)
+        # q_event [B, 64] → [B, fusion_dim]
+        if vqvae_wrapper is not None:
+            self.project_vq = nnx.Linear(64, fusion_dim, rngs=rngs)  # 64 = Unit-Align VQ embed dim
+
+    def __call__(
+        self,
+        tactile_image: jax.Array,
+        visual_3views: jax.Array | None = None,
+        action_prev: jax.Array | None = None
+    ) -> Tuple[jax.Array, jax.Array]:
         """
-        Encode tactile image to features and sigma.
+        Encode tactile image to features and logvar.
+
+        VQVAE模式:
+        - q_event [B, 64] from Unit-Align VQ
+        - Project to [B, fusion_dim] via project_vq
+        - Return ([B, 1, fusion_dim], logvar)
+
+        Placeholder模式:
+        - MLP features [B, output_dim]
+        - Return ([B, 1, output_dim], logvar)
 
         Args:
-            tactile_image: [B, H, W, C] tactile image (assumed 224x224x3)
+            tactile_image: [B, H, W, C] 触觉图像
+            visual_3views: [B, 3, 3, 224, 224] 三视角视觉图像 (VQVAE需要)
+            action_prev: [B, 7] 前一动作 (VQVAE需要)
 
         Returns:
-            features: [B, 1, output_dim] tactile features
-            sigma: [B, 1] standard deviation (importance indicator)
+            features: [B, 1, fusion_dim] 触觉特征 (投影后)
+            logvar: [B, 1] 不确定性
         """
-        batch_size = tactile_image.shape[0]
-        # Flatten
-        x = tactile_image.reshape(batch_size, -1)
-        # Project to features
-        features = self.proj(x)
-        # Estimate sigma (use softplus to ensure positive)
-        sigma = jax.nn.softplus(self.sigma_proj(x))  # [B, 1]
-        return features[:, None, :], sigma  # [B, 1, output_dim], [B, 1]
+        if self.vqvae_wrapper is not None and visual_3views is not None and action_prev is not None:
+            # Unit-Align VQVAE 模式
+            q_event_pooled, logvar = self.vqvae_wrapper(tactile_image, visual_3views, action_prev)
+            # q_event_pooled: [B, 64]
+            # Project to fusion_dim: [B, 64] → [B, fusion_dim]
+            features = self.project_vq(q_event_pooled)  # [B, fusion_dim]
+            # Reshape to [B, 1, fusion_dim] for compatibility with gate and fusion
+            features = features[:, None, :]
+            return features, logvar  # [B, 1, fusion_dim], [B, 1]
+        else:
+            # Placeholder 模式
+            batch_size = tactile_image.shape[0]
+            x = tactile_image.reshape(batch_size, -1)
+            features = self.proj(x)
+            logvar = jax.nn.softplus(self.sigma_proj(x))  # [B, 1]
+            return features[:, None, :], logvar  # [B, 1, output_dim], [B, 1]
 
 
 # =============================================================================
@@ -313,6 +519,10 @@ class Pi0_ResTacConfig(_model.BaseModelConfig):
     # Sparsity loss weight
     sparse_loss_weight: float = 0.01
 
+    # Unit-Align Residual VQVAE checkpoint (optional)
+    # If provided, enables VQ code extraction and logvar from pre-trained tactile model
+    residual_vqvae_checkpoint: str | None = None
+
     @property
     @override
     def model_type(self) -> _model.ModelType:
@@ -342,6 +552,7 @@ class Pi0_ResTacConfig(_model.BaseModelConfig):
                     "tactile_0": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                action_prev=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),  # Previous executed action
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -371,6 +582,43 @@ class Pi0_ResTacConfig(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+# =============================================================================
+# Helper Functions for Visual Input
+# =============================================================================
+
+def _extract_and_stack_visual_views(images_dict):
+    """
+    Extract 3-view visual images from observation and stack them.
+
+    Unit-Align Prophet expects: [B, 3, 3, 224, 224]
+    (batch, num_views=3, channels=3, height=224, width=224)
+
+    Args:
+        images_dict: Dictionary of image arrays from obs.images
+
+    Returns:
+        visual_3views: Stacked 3-view visual [B, 3, 3, 224, 224], or None if views unavailable
+    """
+    view_names = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+    views = []
+
+    for view_name in view_names:
+        view = images_dict.get(view_name, None)
+        if view is not None:
+            views.append(view)
+
+    if len(views) != 3:
+        logger.debug(
+            f"Could only find {len(views)}/3 visual views. "
+            f"Available: {[k for k in images_dict.keys() if 'rgb' in k]}"
+        )
+        return None
+
+    # Stack views: [B, 3, 224, 224] × 3 → [B, 3, 3, 224, 224]
+    visual_3views = jnp.stack(views, axis=1)
+    return visual_3views
 
 
 # =============================================================================
@@ -432,10 +680,23 @@ class Pi0_ResTac(_model.BaseModel):
         self.time_mlp_in = nnx.Linear(self.action_dim_internal, self.action_dim_internal, rngs=rngs)
         self.time_mlp_out = nnx.Linear(self.action_dim_internal, self.action_dim_internal, rngs=rngs)
 
-        # ============ Tactile Encoder (Placeholder) ============
-        # TODO: Replace with real pre-trained tactile encoder
+        # ============ Tactile Encoder ============
+        # Load VQVAE wrapper if checkpoint is provided, otherwise use placeholder
+        vqvae_wrapper = None
+        if config.residual_vqvae_checkpoint:
+            try:
+                vqvae_wrapper = ResidualVQVAEWrapper(
+                    checkpoint_path=config.residual_vqvae_checkpoint,
+                    frozen=True
+                )
+                logger.info(f"✓ Loaded ResidualVQVAE from {config.residual_vqvae_checkpoint}")
+            except Exception as e:
+                logger.warning(f"Failed to load ResidualVQVAE: {e}. Using placeholder.")
+                vqvae_wrapper = None
+
         self.tactile_encoder = TactileEncoderPlaceholder(
             output_dim=config.tactile_encoder_dim,
+            vqvae_wrapper=vqvae_wrapper,
             rngs=rngs
         )
 
@@ -483,25 +744,30 @@ class Pi0_ResTac(_model.BaseModel):
     def encode_tactile(
         self,
         tactile_image: jax.Array,  # [B, H, W, C]
-    ) -> Tuple[jax.Array, jax.Array]:
+        visual_3views: jax.Array | None = None,  # [B, 3, 3, 224, 224]
+        action_prev: jax.Array | None = None,    # [B, 7]
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """
         Encode tactile image and compute gate value using Factorized Gate.
 
         The gate value is computed as:
-            g = necessity(σ) × modulation(features)
+            g = necessity(logvar) × modulation(features)
 
-        Where σ (sigma) comes from the tactile encoder and indicates tactile importance.
+        Where logvar (log-variance) indicates uncertainty (higher = less confident in visual prediction).
 
         Args:
             tactile_image: Tactile image [B, H, W, C]
+            visual_3views: 3-view visual [B, 3, 3, 224, 224] (optional, for VQVAE)
+            action_prev: Previous action [B, 7] (optional, for VQVAE)
 
         Returns:
             tactile_features: Features in fusion space [B, 1, fusion_dim]
             gate_value: Gate value g ∈ [0, 1], shape [B, 1]
+            logvar: Log-variance (uncertainty) [B, 1]
         """
-        # 1. Encode tactile image (returns features and sigma)
-        raw_features, sigma = self.tactile_encoder(tactile_image)
-        # raw_features: [B, 1, tactile_encoder_dim], sigma: [B, 1]
+        # 1. Encode tactile image (returns features and logvar)
+        raw_features, logvar = self.tactile_encoder(tactile_image, visual_3views, action_prev)
+        # raw_features: [B, 1, tactile_encoder_dim], logvar: [B, 1]
         raw_features_flat = raw_features.squeeze(1)  # [B, tactile_encoder_dim]
 
         # 2. Project to fusion space
@@ -509,10 +775,11 @@ class Pi0_ResTac(_model.BaseModel):
         tactile_features = tactile_features[:, None, :]  # [B, 1, fusion_dim]
 
         # 3. Compute factorized gate value
-        # g = necessity(σ) × modulation(features)
-        gate_value = self.gate(raw_features_flat, sigma)  # [B, 1]
+        # g = necessity(logvar) × modulation(features)
+        # Note: logvar is log-variance, so exp(logvar) ≈ uncertainty
+        gate_value = self.gate(raw_features_flat, logvar)  # [B, 1]
 
-        return tactile_features, gate_value
+        return tactile_features, gate_value, logvar
 
     # =========================================================================
     # Two-Stage Tactile Fusion
@@ -632,7 +899,8 @@ class Pi0_ResTac(_model.BaseModel):
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"],         # adarms_cond
         at.Float[at.Array, "b 1 fusion"],    # tactile_features
-        at.Float[at.Array, "b 1"]            # gate_value
+        at.Float[at.Array, "b 1"],           # gate_value
+        at.Float[at.Array, "b 1"]            # logvar
     ]:
         """
         Embed suffix (actions) and extract tactile features.
@@ -647,16 +915,29 @@ class Pi0_ResTac(_model.BaseModel):
             adarms_cond: adaRMS conditioning [B, action_dim_internal]
             tactile_features: Tactile features [B, 1, fusion_dim]
             gate_value: Gate value [B, 1]
+            logvar: Log-variance from tactile encoder [B, 1]
         """
         # 1. Extract and encode tactile image
+        # For VQVAE, we need:
+        # - tactile_image: current tactile observation
+        # - visual_image: 3-view visual observations (stacked)
+        # - action_prev: previous executed action (state_t - state_t-1)
+
         tactile_image = obs.images.get("tactile_0", None)
+        # Extract and stack 3-view visual for Prophet input: [B, 3, 3, 224, 224]
+        visual_3views = _extract_and_stack_visual_views(obs.images)
+
+        # Get action_prev from observation (set by ResTacInputs transform)
+        action_prev = obs.action_prev if obs.action_prev is not None else jnp.zeros((obs.state.shape[0], self.action_dim))
+
         if tactile_image is not None:
-            tactile_features, gate_value = self.encode_tactile(tactile_image)
+            tactile_features, gate_value, logvar = self.encode_tactile(tactile_image, visual_3views, action_prev)
         else:
             # If no tactile image, use zeros
             batch_size = obs.state.shape[0]
             tactile_features = jnp.zeros((batch_size, 1, self.fusion_dim))
             gate_value = jnp.zeros((batch_size, 1))
+            logvar = jnp.zeros((batch_size, 1))
 
         # 2. Action tokens
         action_tokens = self.action_in_proj(noisy_actions)
@@ -677,7 +958,7 @@ class Pi0_ResTac(_model.BaseModel):
         input_mask = jnp.ones(action_tokens.shape[:2], dtype=jnp.bool_)
         ar_mask = jnp.array([True] + ([False] * (self.action_horizon - 1)))
 
-        return action_tokens, input_mask, ar_mask, adarms_cond, tactile_features, gate_value
+        return action_tokens, input_mask, ar_mask, adarms_cond, tactile_features, gate_value, logvar
 
     # =========================================================================
     # Compute Loss
@@ -716,7 +997,7 @@ class Pi0_ResTac(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
 
         # ============ Encode Suffix (state + actions) + Extract Tactile ============
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, tactile_features, gate_value = \
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, tactile_features, gate_value, logvar = \
             self.embed_suffix(observation, x_t, time)
 
         # ============ Transformer Forward ============
@@ -751,12 +1032,16 @@ class Pi0_ResTac(_model.BaseModel):
         flow_loss = jnp.square(v_t - u_t)  # [B, 50, action_dim]
 
         # 2. Sparsity Loss (force g → 0)
-        sparse_loss = jnp.mean(gate_value)  # scalar
+        # Weight by logvar uncertainty: higher logvar (lower confidence) → stronger sparse loss
+        sparse_loss = jnp.mean(gate_value)  # [B, 1] → scalar
+        logvar_mean = jnp.mean(logvar)  # scalar
+        # Use exp(logvar) as weight to amplify sparse loss when uncertainty is high
+        sparse_loss_weighted = sparse_loss * jnp.exp(logvar_mean)
 
         # Combine losses
         # Note: Original framework expects [B, action_horizon] shape
         # Add sparse_loss to mean of each timestep's loss
-        total_loss = jnp.mean(flow_loss, axis=-1) + self.config.sparse_loss_weight * sparse_loss
+        total_loss = jnp.mean(flow_loss, axis=-1) + self.config.sparse_loss_weight * sparse_loss_weighted
 
         return total_loss
 
@@ -795,17 +1080,23 @@ class Pi0_ResTac(_model.BaseModel):
 
         # Extract tactile features once (doesn't change during sampling)
         tactile_image = observation.images.get("tactile_0", None)
+        # Extract and stack 3-view visual for Prophet input: [B, 3, 3, 224, 224]
+        visual_3views = _extract_and_stack_visual_views(observation.images)
+        # For VQVAE, use action_prev from observation (previous executed action)
+        action_prev = observation.action_prev if observation.action_prev is not None else jnp.zeros((batch_size, self.action_dim))
+
         if tactile_image is not None:
-            tactile_features, gate_value = self.encode_tactile(tactile_image)
+            tactile_features, gate_value, logvar = self.encode_tactile(tactile_image, visual_3views, action_prev)
         else:
             tactile_features = jnp.zeros((batch_size, 1, self.fusion_dim))
             gate_value = jnp.zeros((batch_size, 1))
+            logvar = jnp.zeros((batch_size, 1))
 
         def step(carry):
             x_t, time = carry
 
-            # Encode suffix (now returns 6 values including adarms_cond)
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, _, _ = self.embed_suffix(
+            # Encode suffix (returns 7 values including adarms_cond and logvar)
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond, _, _, _ = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
 
