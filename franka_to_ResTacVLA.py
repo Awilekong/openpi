@@ -75,36 +75,53 @@ def quaternion_to_rotation_vector(quaternions: np.ndarray) -> np.ndarray:
 @dataclass
 class Config:
     """全局配置"""
-    # 数据路径
-    data_root: Path = Path("/home/zpw/ws_zpw/vla/data/2025_11_18")
-    task_folder: str = "peg_in_hole1"
-    
+    # 数据路径列表 (支持多个源目录合并)
+    source_paths: List[Path] = None
+
     # 输出配置
-    repo_id: str = "franka/peg_in_hole"
-    output_dir: Path = Path.home() / "ws_zpw" / "vla" / "data" / "lerobot_data" # 数据集保存目录
+    repo_id: str = "wipe_plate"
+    output_dir: Path = Path("/home/dataset-local/data/megvii_post/tac")  # 数据集保存目录
     target_size: Tuple[int, int] = (224, 224)  # (H, W)
-    
+    tactile_size: Tuple[int, int] = (128, 160)  # 触觉图像目标尺寸 (H, W)
+
     # 动作空间配置
     action_space: ActionSpace = ActionSpace.EE_POSE_DELTA
-    
+
     # 数据处理
     stride: int = 1  # 采样间隔
-    
+
     # 帧过滤配置
     enable_frame_filtering: bool = True  # 是否启用帧过滤
     frame_filter_threshold: float = 1e-10  # 帧过滤阈值：state 变化幅度 (默认只过滤静止帧)
     min_frames_per_episode: int = 10  # 每个 episode 最少保留的帧数
-    
-    # None 表示转换所有，否则转换前n个s
+
+    # 夹爪配置
+    enable_gripper_binarization: bool = True  # 是否启用夹爪二值化
+    gripper_binarization_threshold: float = 0.079  # 夹爪二值化阈值
+
+    # 提示词配置
+    prompt: Optional[str] = None  # 如果指定，将覆盖 meta.json 中的 prompt
+
+    # None 表示转换所有，否则转换前n个
     max_episodes: Optional[int] = None
-    
+
     # 相机配置
     camera_names: List[str] = None  # None表示自动检测
-    
+
+    # 触觉数据配置
+    require_tactile: bool = True  # 是否要求触觉数据完整
+    tactile_delay_offset: float = 0.3  # 触觉硬件延迟补偿 (秒)，触觉实际时间 = 记录时间 - offset
+
     def __post_init__(self):
+        if self.source_paths is None:
+            # 默认路径列表
+            self.source_paths = [
+                Path("/home/dataset-local/data/megvii/wipe_plate"),
+            ]
+
         if self.camera_names is None:
             self.camera_names = ["main_realsense_rgb", "side_realsense_rgb", "handeye_realsense_rgb"]
-        
+
         # 根据动作空间自动更新 repo_id
         action_suffix = self.action_space.value
         if action_suffix not in self.repo_id:
@@ -114,50 +131,56 @@ class Config:
 # ===== 数据读取模块 =====
 
 class FrankaDataLoader:
-    """Franka 数据加载器"""
-    
+    """Franka 数据加载器 (支持多数据源)"""
+
     def __init__(self, config: Config):
         self.config = config
-        self.data_root = config.data_root / config.task_folder
-        
-    def get_all_episodes(self) -> List[str]:
-        """获取所有 episode 时间文件夹"""
-        if not self.data_root.exists():
-            raise ValueError(f"Task folder not found: {self.data_root}")
-        
-        episodes = sorted([d.name for d in self.data_root.iterdir() if d.is_dir()])
-        
+
+    def get_all_episodes(self) -> List[Path]:
+        """获取所有 episode 的完整路径"""
+        all_episodes = []
+
+        for source_path in self.config.source_paths:
+            if not source_path.exists():
+                print(f"Warning: Source path not found: {source_path}")
+                continue
+
+            # 获取该源下的所有 episode 目录
+            episodes = sorted([d for d in source_path.iterdir() if d.is_dir()])
+            print(f"Found {len(episodes)} episodes in {source_path}")
+            all_episodes.extend(episodes)
+
         if self.config.max_episodes:
-            episodes = episodes[:self.config.max_episodes]
-            
-        return episodes
-    
-    def load_meta(self, episode: str) -> Dict:
+            all_episodes = all_episodes[:self.config.max_episodes]
+
+        return all_episodes
+
+    def load_meta(self, episode_path: Path) -> Dict:
         """加载 meta.json"""
-        meta_path = self.data_root / episode / "v1" / "meta.json"
+        meta_path = episode_path / "v1" / "meta.json"
         if not meta_path.exists():
             raise FileNotFoundError(f"meta.json not found: {meta_path}")
-        
+
         with open(meta_path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    
-    def load_robot_data(self, episode: str) -> Dict[str, np.ndarray]:
+
+    def load_robot_data(self, episode_path: Path) -> Dict[str, np.ndarray]:
         """从 jsonl 加载机器人数据"""
-        jsonl_path = self.data_root / episode / "v1" / "data" / "Franka_4_arms_arm.jsonl"
-        
+        jsonl_path = episode_path / "v1" / "data" / "Franka_4_arms_arm.jsonl"
+
         if not jsonl_path.exists():
             raise FileNotFoundError(f"Robot data not found: {jsonl_path}")
-        
+
         with jsonlines.open(jsonl_path) as reader:
             data = list(reader)
-        
-        # 提取字段
-        timestamps = np.array([d['timestamp'] for d in data], dtype=np.float32)
+
+        # 提取字段 (Unix 时间戳需要 float64 精度，float32 会丢失约 50 秒精度)
+        timestamps = np.array([d['timestamp'] for d in data], dtype=np.float64)
         joint_positions = np.array([d['joint_positions'] for d in data], dtype=np.float32)  # (T, 7)
         ee_positions = np.array([d['ee_positions'] for d in data], dtype=np.float32)  # (T, 7)
         gripper = np.array([d['gripper'] for d in data], dtype=np.float32)  # (T, 2)
         gripper_width = np.array([d['gripper_width'][0] for d in data], dtype=np.float32)  # (T,)
-        
+
         return {
             'timestamps': timestamps,
             'joint_positions': joint_positions,  # (T, 7) - Franka 有 7 个关节
@@ -165,26 +188,49 @@ class FrankaDataLoader:
             'gripper': gripper,  # (T, 2) - 两个手指
             'gripper_width': gripper_width,  # (T,) - 夹爪宽度
         }
-    
-    def load_video_frames(self, episode: str, frame_indices: List[int]) -> Dict[str, np.ndarray]:
+
+    def load_camera_timestamps(self, episode_path: Path, camera_name: str = "main_realsense") -> np.ndarray:
+        """加载相机时间戳文件
+
+        Args:
+            episode_path: episode 路径
+            camera_name: 相机名称 (不带 _rgb 后缀)
+
+        Returns:
+            timestamps: (T,) float64 时间戳数组 (单位: 秒)
+        """
+        ts_path = episode_path / "v1" / "origin_data" / f"{camera_name}_timestamps.jsonl"
+        if not ts_path.exists():
+            raise FileNotFoundError(f"Camera timestamps not found: {ts_path}")
+
+        timestamps = []
+        with jsonlines.open(ts_path) as reader:
+            for record in reader:
+                # timestamp 是毫秒，转换为秒
+                ts = record['timestamp'] / 1000.0
+                timestamps.append(ts)
+
+        return np.array(timestamps, dtype=np.float64)
+
+    def load_video_frames(self, episode_path: Path, frame_indices: List[int]) -> Dict[str, np.ndarray]:
         """加载指定帧的图像（并行加载多个相机）"""
-        video_dir = self.data_root / episode / "v1" / "videos"
-        
+        video_dir = episode_path / "v1" / "videos"
+
         def load_camera(cam_name):
             video_path = video_dir / f"{cam_name}.mp4"
             if not video_path.exists():
                 raise FileNotFoundError(f"Video not found: {video_path}")
             return cam_name, self._extract_frames(str(video_path), frame_indices)
-        
+
         # 并行加载所有相机
         frames = {}
         with ThreadPoolExecutor(max_workers=len(self.config.camera_names)) as executor:
             results = executor.map(load_camera, self.config.camera_names)
             for cam_name, cam_frames in results:
                 frames[cam_name] = cam_frames
-        
+
         return frames
-    
+
     def _extract_frames(self, video_path: str, frame_indices: List[int]) -> np.ndarray:
         """从视频提取指定索引的帧，返回 (T, H, W, 3) RGB uint8"""
         cap = cv2.VideoCapture(video_path)
@@ -204,14 +250,14 @@ class FrankaDataLoader:
         cap.release()
         return np.array(frames, dtype=np.uint8)
 
-    def load_tactile_video(self, episode: str) -> Tuple[np.ndarray, np.ndarray]:
+    def load_tactile_video(self, episode_path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """加载 GelSight 触觉视频和对应的时间戳
 
         Returns:
             tactile_frames: (T_tactile, H, W, 3) RGB uint8
-            tactile_timestamps: (T_tactile,) float32 Unix时间戳
+            tactile_timestamps: (T_tactile,) float64 Unix时间戳
         """
-        video_dir = self.data_root / episode / "v1" / "gelsight"
+        video_dir = episode_path / "v1" / "gelsight"
         video_path = video_dir / "gelsight_left_rgb.mp4"
 
         if not video_path.exists():
@@ -234,14 +280,14 @@ class FrankaDataLoader:
 
         tactile_frames = np.array(frames, dtype=np.uint8)
 
-        # 读取时间戳文件
-        ts_path = self.data_root / episode / "v1" / "origin_data" / "gelsight_left_timestamps.txt"
+        # 读取时间戳文件 (使用 float64 保持精度，Unix 时间戳需要高精度)
+        ts_path = episode_path / "v1" / "origin_data" / "gelsight_left_timestamps.txt"
         if ts_path.exists():
-            tactile_timestamps = np.loadtxt(ts_path, dtype=np.float32)
+            tactile_timestamps = np.loadtxt(ts_path, dtype=np.float64)
         else:
             # 备用：从视频FPS估算
             fps = 10.0  # GelSight 标准频率
-            tactile_timestamps = np.arange(len(frames), dtype=np.float32) / fps
+            tactile_timestamps = np.arange(len(frames), dtype=np.float64) / fps
 
         return tactile_frames, tactile_timestamps
 
@@ -258,62 +304,72 @@ class DataProcessor:
         self,
         robot_data: Dict[str, np.ndarray],
         video_frames: Dict[str, np.ndarray],
+        camera_timestamps: Optional[np.ndarray] = None,
         tactile_frames: Optional[np.ndarray] = None,
         tactile_timestamps: Optional[np.ndarray] = None
     ) -> Dict[str, np.ndarray]:
         """处理单个 episode 的数据
 
-        处理流程:
-        1. 步骤1: Stride 采样 - 从原始数据中按 stride 间隔采样
-        2. 步骤2: 【可选】帧过滤 - 在 stride 采样后的数据上，根据相邻帧的 state 变化过滤关键帧
-        3. 步骤3: 计算 action - 基于过滤后的帧计算 action (delta 或 next_frame)
-        4. 步骤4: 处理 gripper、视频帧、和触觉帧
+        处理流程 (统一以相机时间戳为基准):
+        1. 步骤1: 在相机帧上进行 stride 采样
+        2. 步骤2: 将机器人状态对齐到相机时间戳
+        3. 步骤3: 【可选】帧过滤 - 根据 state 变化过滤关键帧
+        4. 步骤4: 计算 action - 基于过滤后的帧计算 action (delta 或 next_frame)
+        5. 步骤5: 处理视频帧和触觉帧（触觉需要 -0.3s 延迟补偿）
         """
         stride = self.config.stride
         action_space = self.config.action_space
-        
-        # === 步骤1: Stride 采样 ===
-        T_raw = len(robot_data['timestamps'])
-        stride_indices = list(range(0, T_raw - stride, stride))
-        
+
+        if camera_timestamps is None:
+            raise ValueError("Camera timestamps are required for proper alignment")
+
+        # === 步骤1: 在相机帧上进行 stride 采样 ===
+        T_camera = len(camera_timestamps)
+        stride_cam_indices = list(range(0, T_camera - stride, stride))
+
         # 检查视频帧数量是否匹配
         first_cam_frames = list(video_frames.values())[0]
-        if len(first_cam_frames) != len(stride_indices):
+        if len(first_cam_frames) < len(stride_cam_indices):
             # 视频帧数量与预期不符，裁剪到最小长度
-            min_len = min(len(stride_indices), len(first_cam_frames))
-            stride_indices = stride_indices[:min_len]
-        
-        # 根据动作空间提取原始 state 数据
+            stride_cam_indices = stride_cam_indices[:len(first_cam_frames)]
+
+        # === 步骤2: 将机器人状态对齐到相机时间戳 ===
+        aligned_robot_data = self.align_robot_to_camera(
+            robot_data,
+            camera_timestamps,
+            stride_cam_indices
+        )
+
+        # 根据动作空间提取 state 数据
         if action_space in [ActionSpace.JOINT_POSITION_GLOBAL, ActionSpace.JOINT_POSITION_DELTA]:
             # 使用关节空间
-            raw_state_data = robot_data['joint_positions']  # (T_raw, 7)
+            stride_state_data = aligned_robot_data['joint_positions']  # (T_stride, 7)
         elif action_space in [ActionSpace.EE_POSE_GLOBAL, ActionSpace.EE_POSE_DELTA]:
             # 使用末端位姿空间 - 需要先转换为 xyz + rotation_vector
-            ee_positions = robot_data['ee_positions']  # (T_raw, 7) - xyz(3) + quaternion(4)
-            ee_xyz = ee_positions[:, :3]  # (T_raw, 3)
-            ee_quat = ee_positions[:, 3:]  # (T_raw, 4)
-            ee_rotvec = quaternion_to_rotation_vector(ee_quat)  # (T_raw, 3)
-            raw_state_data = np.concatenate([ee_xyz, ee_rotvec], axis=1)  # (T_raw, 6)
-        
-        # 先进行 stride 采样
-        stride_state_data = raw_state_data[stride_indices]  # (T_stride, D)
-        
-        # === 步骤2: 【可选】帧过滤 ===
+            ee_positions = aligned_robot_data['ee_positions']  # (T_stride, 7) - xyz(3) + quaternion(4)
+            ee_xyz = ee_positions[:, :3]  # (T_stride, 3)
+            ee_quat = ee_positions[:, 3:]  # (T_stride, 4)
+            ee_rotvec = quaternion_to_rotation_vector(ee_quat)  # (T_stride, 3)
+            stride_state_data = np.concatenate([ee_xyz, ee_rotvec], axis=1)  # (T_stride, 6)
+
+        # === 步骤3: 【可选】帧过滤 ===
         # 在 stride 采样后的数据上进行过滤
         if self.config.enable_frame_filtering:
-            # 返回在 stride_indices 中的索引位置
+            # 返回在 stride_cam_indices 中的索引位置
             keep_mask = self._filter_frames_by_motion(stride_state_data)
-            final_indices = [stride_indices[i] for i in range(len(stride_indices)) if keep_mask[i]]
+            final_cam_indices = [stride_cam_indices[i] for i in range(len(stride_cam_indices)) if keep_mask[i]]
             final_state_data = stride_state_data[keep_mask]
+            final_gripper_width = aligned_robot_data['gripper_width'][keep_mask]
         else:
-            final_indices = stride_indices
+            final_cam_indices = stride_cam_indices
             final_state_data = stride_state_data
-        
-        # === 步骤3: 处理数据 ===
+            final_gripper_width = aligned_robot_data['gripper_width']
+
+        # === 步骤4: 处理数据 ===
         processed = {}
-        processed['timestamps'] = robot_data['timestamps'][final_indices]
+        processed['timestamps'] = camera_timestamps[final_cam_indices]  # 使用相机时间戳
         processed['state_data'] = final_state_data
-        
+
         # 计算 action（在最终的 state 数据上计算相邻帧的差异）
         if action_space in [ActionSpace.JOINT_POSITION_GLOBAL, ActionSpace.EE_POSE_GLOBAL]:
             # Action: 下一帧的状态
@@ -321,36 +377,34 @@ class DataProcessor:
         else:  # DELTA 模式
             # Action: 状态增量
             processed['action_data'] = self._compute_delta_from_states(final_state_data)
-        
+
         # 夹爪处理
-        gripper_width = robot_data['gripper_width']
-        gripper_sampled = gripper_width[final_indices]
-        processed['gripper'] = self._binarize_gripper(gripper_sampled)
-        
-        # === 步骤4: 处理视频帧 ===
+        processed['gripper'] = self._binarize_gripper(final_gripper_width)
+
+        # === 步骤5: 处理视频帧 ===
         processed['video_frames'] = {}
         for cam_name, frames in video_frames.items():
             if self.config.enable_frame_filtering:
-                # 计算 final_indices 在 stride_indices 中的位置
-                video_indices = [stride_indices.index(idx) for idx in final_indices]
+                # 计算 final_cam_indices 在 stride_cam_indices 中的位置
+                video_indices = [stride_cam_indices.index(idx) for idx in final_cam_indices]
                 processed['video_frames'][cam_name] = self._resize_frames(frames[video_indices])
             else:
-                processed['video_frames'][cam_name] = self._resize_frames(frames[:len(final_indices)])
+                processed['video_frames'][cam_name] = self._resize_frames(frames[:len(final_cam_indices)])
 
-        # === 步骤4.5: 处理触觉帧（时间对齐） ===
-        if tactile_frames is not None and len(tactile_frames) > 0:
-            aligned_tactile = self.align_tactile_to_robot(
+        # === 步骤5.5: 处理触觉帧（使用相机时间戳对齐，包含延迟补偿） ===
+        if tactile_frames is not None and len(tactile_frames) > 0 and tactile_timestamps is not None:
+            aligned_tactile = self.align_tactile_to_camera(
                 tactile_frames,
                 tactile_timestamps,
-                robot_data['timestamps'],
-                final_indices
+                camera_timestamps,
+                final_cam_indices  # 直接使用最终的相机帧索引
             )
             processed['tactile_frames'] = aligned_tactile
         else:
             # 创建占位触觉帧（空数组表示无触觉数据）
             processed['tactile_frames'] = np.array([])
 
-        # === 步骤5: 计算 action_prev (state_t - state_t-1) ===
+        # === 步骤6: 计算 action_prev (state_t - state_t-1) ===
         processed['action_prev'] = self._compute_action_prev(final_state_data)
 
         return processed
@@ -458,20 +512,11 @@ class DataProcessor:
         return np.array(deltas, dtype=np.float32)
     
     def _binarize_gripper(self, gripper: np.ndarray) -> np.ndarray:
-        """夹爪二值化 - 基于数据分析确定阈值
-        
-        数据分析结果 (基于 50 个 episodes, 49587 个数据点):
-        - 双峰分布:
-          * 合 (closed): 19-24mm (57.3% 的数据)
-          * 开 (open): 70-85mm (40.6% 的数据)
-          * 中间过渡: 25-70mm (仅 2.1% 的数据)
-        
-        - 最常见的值:
-          * 85.00mm: 39.3% (完全开启)
-          * 20.22mm: 31.5% (抓紧物体)
-          * 19.85mm: 23.8% (最紧)
-        """
-        threshold = 0.025  # 25mm
+        """夹爪处理 - 可配置是否二值化"""
+        if not self.config.enable_gripper_binarization:
+            return gripper.astype(np.float32)
+
+        threshold = self.config.gripper_binarization_threshold
         return np.where(gripper < threshold, 0.0, 1.0).astype(np.float32)
     
     def _resize_frames(self, frames: np.ndarray) -> np.ndarray:
@@ -502,20 +547,68 @@ class DataProcessor:
 
         return action_prev.astype(np.float32)
 
-    def align_tactile_to_robot(
+    def align_robot_to_camera(
+        self,
+        robot_data: Dict[str, np.ndarray],
+        camera_timestamps: np.ndarray,
+        frame_indices: List[int]
+    ) -> Dict[str, np.ndarray]:
+        """使用相机时间戳对齐机器人数据
+
+        统一以相机时间戳为基准，为每个相机帧找最近的机器人状态
+
+        Args:
+            robot_data: 机器人数据字典，包含 timestamps, joint_positions, ee_positions, gripper_width 等
+            camera_timestamps: (T_camera,) 相机时间戳 (秒)
+            frame_indices: 选中的相机帧索引列表
+
+        Returns:
+            aligned_robot_data: 对齐后的机器人数据字典
+        """
+        robot_ts = robot_data['timestamps'].astype(np.float64)
+
+        # 为每个相机帧找最近的机器人状态索引
+        aligned_indices = []
+        for cam_idx in frame_indices:
+            cam_ts = camera_timestamps[cam_idx]
+
+            # 找最近的机器人时间戳
+            time_diffs = np.abs(robot_ts - cam_ts)
+            nearest_idx = np.argmin(time_diffs)
+
+            # 如果对齐误差较大（超过 0.2 秒，约 3 帧间隔），打印警告
+            if time_diffs[nearest_idx] > 0.2:
+                print(f"  [Robot Align] Large gap: {time_diffs[nearest_idx]:.3f}s at cam_idx {cam_idx}")
+
+            aligned_indices.append(nearest_idx)
+
+        # 提取对齐后的数据
+        aligned_data = {}
+        aligned_data['timestamps'] = camera_timestamps[frame_indices]  # 使用相机时间戳作为最终时间戳
+        aligned_data['joint_positions'] = robot_data['joint_positions'][aligned_indices]
+        aligned_data['ee_positions'] = robot_data['ee_positions'][aligned_indices]
+        aligned_data['gripper'] = robot_data['gripper'][aligned_indices]
+        aligned_data['gripper_width'] = robot_data['gripper_width'][aligned_indices]
+
+        return aligned_data
+
+    def align_tactile_to_camera(
         self,
         tactile_frames: np.ndarray,
         tactile_timestamps: np.ndarray,
-        robot_timestamps: np.ndarray,
-        final_indices: List[int]
+        camera_timestamps: np.ndarray,
+        frame_indices: List[int]
     ) -> np.ndarray:
-        """使用最近邻插值将触觉帧对齐到最终的机器人时间线
+        """使用相机时间戳对齐触觉帧
+
+        注意：触觉数据存在硬件延迟，实际采集时间 = 记录时间 - delay_offset
+        因此在对齐时需要将触觉时间戳减去延迟补偿值
 
         Args:
             tactile_frames: (T_tactile, H, W, 3)
-            tactile_timestamps: (T_tactile,) 触觉时间戳
-            robot_timestamps: (T_raw,) 机器人原始时间戳
-            final_indices: 最终选中的帧索引列表（从 process_episode 中获取）
+            tactile_timestamps: (T_tactile,) 触觉时间戳 (秒)
+            camera_timestamps: (T_camera,) 相机时间戳 (秒)
+            frame_indices: 选中的相机帧索引列表
 
         Returns:
             aligned_tactile: (T_final, H, W, 3) 对齐后的触觉帧
@@ -523,18 +616,25 @@ class DataProcessor:
         if len(tactile_frames) == 0:
             return np.array([])
 
-        # 为每个最终帧找最近的触觉帧
-        aligned_frames = []
-        for robot_idx in final_indices:
-            robot_ts = robot_timestamps[robot_idx]
+        # 应用触觉硬件延迟补偿：实际采集时间 = 记录时间 - delay_offset
+        # 例如：触觉记录时间为 t，实际是在 t-0.3s 时采集的
+        # 所以要找相机时间 cam_ts 对应的触觉帧，应该找 tactile_ts - offset 最接近 cam_ts 的
+        delay_offset = self.config.tactile_delay_offset
+        corrected_tactile_ts = tactile_timestamps - delay_offset
 
-            # 找最近的触觉时间戳
-            time_diffs = np.abs(tactile_timestamps - robot_ts)
+        # 为每个相机帧找最近的触觉帧
+        aligned_frames = []
+        for cam_idx in frame_indices:
+            cam_ts = camera_timestamps[cam_idx]
+
+            # 找最近的触觉时间戳（使用校正后的时间戳）
+            time_diffs = np.abs(corrected_tactile_ts - cam_ts)
             nearest_idx = np.argmin(time_diffs)
 
-            # 如果对齐误差较大，打印警告
-            if time_diffs[nearest_idx] > 0.1:
-                print(f"  [Tactile Align] Large gap: {time_diffs[nearest_idx]:.3f}s at robot_idx {robot_idx}")
+            # 如果对齐误差较大（超过 0.15 秒，约 1.5 个触觉帧间隔），打印警告
+            if time_diffs[nearest_idx] > 0.15:
+                print(f"  [Tactile Align] Large gap: {time_diffs[nearest_idx]:.3f}s at cam_idx {cam_idx} "
+                      f"(delay_offset={delay_offset}s)")
 
             aligned_frames.append(tactile_frames[nearest_idx])
 
@@ -600,9 +700,10 @@ class LeRobotConverter:
             }
 
         # 添加触觉特征
+        tac_H, tac_W = self.config.tactile_size
         features["observation.images.gelsight_left_rgb"] = {
             "dtype": "image",
-            "shape": (128, 160, C),  # GelSight 原生分辨率
+            "shape": (tac_H, tac_W, C),  # 触觉图像尺寸
             "names": ["height", "width", "channels"],
         }
 
@@ -616,6 +717,7 @@ class LeRobotConverter:
         self.dataset = LeRobotDataset.create(
             repo_id=self.config.repo_id,
             fps=fps,
+            root=self.config.output_dir / self.config.repo_id,
             robot_type="franka",
             features=features,
             use_videos=False,
@@ -661,9 +763,12 @@ class LeRobotConverter:
             for cam_name in self.config.camera_names:
                 frame[f"observation.images.{cam_name}"] = processed_data['video_frames'][cam_name][t]
 
-            # 添加触觉图像
+            # 添加触觉图像 (resize 到配置的尺寸)
             if len(tactile_data) > 0:
-                frame["observation.images.gelsight_left_rgb"] = tactile_data[t]
+                tactile_img = tactile_data[t]
+                tac_H, tac_W = self.config.tactile_size
+                tactile_resized = cv2.resize(tactile_img, (tac_W, tac_H), interpolation=cv2.INTER_AREA)
+                frame["observation.images.gelsight_left_rgb"] = tactile_resized
 
             self.dataset.add_frame(frame)
 
@@ -719,8 +824,13 @@ class LeRobotConverter:
         """提取任务描述字符串"""
         task_meta = meta.get("task_meta", {})
         task_name = task_meta.get("task_name", "unknown")
-        # 使用固定的 prompt，不从 meta.json 读取
-        prompt = "wipe the pen marks off the plate"
+
+        # 优先使用配置中的 prompt
+        if self.config.prompt is not None:
+            prompt = self.config.prompt
+        else:
+            prompt = task_meta.get("prompt", "")
+
         robot_model = meta.get("robot_meta", {}).get("robots", [{}])[0].get("robot_model", "")
 
         return f"{task_name} | {prompt} | robot={robot_model}".strip()
@@ -728,29 +838,73 @@ class LeRobotConverter:
 
 # ===== 主流程 =====
 
-def _check_tactile_complete(loader: FrankaDataLoader, episode: str) -> bool:
+def _check_tactile_complete(episode_path: Path) -> bool:
     """检查触觉数据是否完整
 
     Returns:
         True 如果 gelsight 视频和时间戳都存在
     """
-    video_path = loader.data_root / episode / "v1" / "gelsight" / "gelsight_left_rgb.mp4"
-    ts_path = loader.data_root / episode / "v1" / "origin_data" / "gelsight_left_timestamps.txt"
+    video_path = episode_path / "v1" / "gelsight" / "gelsight_left_rgb.mp4"
+    ts_path = episode_path / "v1" / "origin_data" / "gelsight_left_timestamps.txt"
 
     return video_path.exists() and ts_path.exists()
 
 
 def main():
     """主函数"""
+    import argparse
+    parser = argparse.ArgumentParser(description="Franka to LeRobot Converter with Tactile Support")
+    parser.add_argument("--prompt", type=str, default=None, help="Override prompt for all episodes")
+    parser.add_argument("--input", type=Path, nargs='+', help="Input directories (multiple supported)")
+    parser.add_argument("--output", type=Path, default=None, help="Output root directory")
+    parser.add_argument("--repo-id", type=str, default=None, help="Dataset repo ID")
+    parser.add_argument("--no-filter", action="store_true", help="Disable frame filtering")
+    parser.add_argument("--filter-threshold", type=float, default=1e-10, help="Frame filter threshold")
+    parser.add_argument("--stride", type=int, default=1, help="Sampling stride")
+    parser.add_argument("--no-binarize-gripper", action="store_false", dest="binarize_gripper",
+                        help="Disable gripper binarization")
+    parser.add_argument("--gripper-threshold", type=float, default=0.079,
+                        help="Threshold for gripper binarization (default: 0.079)")
+    parser.add_argument("--no-require-tactile", action="store_false", dest="require_tactile",
+                        help="Don't require tactile data (process episodes without tactile)")
+    parser.add_argument("--tactile-size", type=int, nargs=2, default=[128, 160],
+                        help="Tactile image size (H W), default: 128 160")
+    parser.add_argument("--tactile-delay", type=float, default=0.3,
+                        help="Tactile hardware delay offset in seconds (default: 0.3)")
+    parser.set_defaults(binarize_gripper=True, require_tactile=True)
+
+    args = parser.parse_args()
+
     config = Config()
 
-    # 示例: 如何修改动作空间
-    # config.action_space = ActionSpace.JOINT_POSITION_GLOBAL
-    # config.action_space = ActionSpace.EE_POSE_GLOBAL
-    # config.action_space = ActionSpace.EE_POSE_DELTA
+    # 应用命令行参数
+    if args.prompt is not None:
+        config.prompt = args.prompt
+
+    if args.input:
+        config.source_paths = args.input
+
+    if args.output:
+        config.output_dir = args.output
+
+    if args.repo_id:
+        config.repo_id = args.repo_id
+
+    if args.no_filter:
+        config.enable_frame_filtering = False
+
+    config.frame_filter_threshold = args.filter_threshold
+    config.stride = args.stride
+    config.enable_gripper_binarization = args.binarize_gripper
+    config.gripper_binarization_threshold = args.gripper_threshold
+    config.require_tactile = args.require_tactile
+    config.tactile_size = tuple(args.tactile_size)
+    config.tactile_delay_offset = args.tactile_delay
 
     print(f"Action space: {config.action_space.value}")
     print(f"Output repo: {config.repo_id}")
+    print(f"Source paths: {config.source_paths}")
+    print(f"Tactile delay offset: {config.tactile_delay_offset}s (tactile_real_ts = recorded_ts - {config.tactile_delay_offset}s)")
 
     # 初始化各模块
     loader = FrankaDataLoader(config)
@@ -758,40 +912,48 @@ def main():
     converter = LeRobotConverter(config)
 
     # 获取所有 episodes
-    all_episodes = loader.get_all_episodes()
-    print(f"Found {len(all_episodes)} episodes")
+    all_episode_paths = loader.get_all_episodes()
+    print(f"Total episodes found: {len(all_episode_paths)}")
 
-    # 过滤出触觉数据完整的 episodes
-    episodes = []
+    # 根据配置过滤 episodes
+    episode_paths = []
     skipped_episodes = []
-    for ep in all_episodes:
-        if _check_tactile_complete(loader, ep):
-            episodes.append(ep)
-        else:
-            skipped_episodes.append(ep)
 
-    print(f"  - Tactile data complete: {len(episodes)} episodes")
-    print(f"  - Skipped (incomplete tactile): {len(skipped_episodes)} episodes")
+    if config.require_tactile:
+        for ep_path in all_episode_paths:
+            if _check_tactile_complete(ep_path):
+                episode_paths.append(ep_path)
+            else:
+                skipped_episodes.append(ep_path)
+        print(f"  - Tactile data complete: {len(episode_paths)} episodes")
+        print(f"  - Skipped (incomplete tactile): {len(skipped_episodes)} episodes")
+    else:
+        episode_paths = all_episode_paths
+        print(f"  - Tactile not required, processing all {len(episode_paths)} episodes")
 
-    if not episodes:
-        raise ValueError("No episodes with complete tactile data found")
+    if not episode_paths:
+        raise ValueError("No valid episodes found")
 
     # 处理第一个 episode 以创建数据集骨架
-    print(f"\nProcessing first episode: {episodes[0]}")
-    first_meta = loader.load_meta(episodes[0])
-    first_robot_data = loader.load_robot_data(episodes[0])
+    print(f"\nProcessing first episode: {episode_paths[0]}")
+    first_meta = loader.load_meta(episode_paths[0])
+    first_robot_data = loader.load_robot_data(episode_paths[0])
 
     # 加载触觉数据
-    first_tactile_frames, first_tactile_ts = loader.load_tactile_video(episodes[0])
+    first_tactile_frames, first_tactile_ts = loader.load_tactile_video(episode_paths[0])
 
-    # 计算帧索引
-    T_raw = len(first_robot_data['timestamps'])
-    frame_indices = list(range(0, T_raw - config.stride, config.stride))
+    # 加载相机时间戳 (作为主时间基准)
+    first_camera_ts = loader.load_camera_timestamps(episode_paths[0], "main_realsense")
 
-    first_video_frames = loader.load_video_frames(episodes[0], frame_indices)
+    # 计算帧索引 (基于相机时间戳，而不是机器人数据)
+    T_camera = len(first_camera_ts)
+    frame_indices = list(range(0, T_camera - config.stride, config.stride))
+
+    first_video_frames = loader.load_video_frames(episode_paths[0], frame_indices)
     first_processed = processor.process_episode(
         first_robot_data,
         first_video_frames,
+        camera_timestamps=first_camera_ts,
         tactile_frames=first_tactile_frames,
         tactile_timestamps=first_tactile_ts
     )
@@ -799,27 +961,40 @@ def main():
     # 创建数据集
     converter.create_dataset(first_processed, first_meta)
 
-    # 转换所有 episodes
-    for episode in tqdm.tqdm(episodes, desc="Converting episodes"):
-        meta = loader.load_meta(episode)
-        robot_data = loader.load_robot_data(episode)
+    # 转换所有 episodes (带错误处理)
+    success_count = 0
+    error_count = 0
 
-        # 加载触觉数据
-        tactile_frames, tactile_ts = loader.load_tactile_video(episode)
+    for episode_path in tqdm.tqdm(episode_paths, desc="Converting episodes"):
+        try:
+            meta = loader.load_meta(episode_path)
+            robot_data = loader.load_robot_data(episode_path)
 
-        # 计算帧索引
-        T_raw = len(robot_data['timestamps'])
-        frame_indices = list(range(0, T_raw - config.stride, config.stride))
+            # 加载触觉数据
+            tactile_frames, tactile_ts = loader.load_tactile_video(episode_path)
 
-        video_frames = loader.load_video_frames(episode, frame_indices)
-        processed_data = processor.process_episode(
-            robot_data,
-            video_frames,
-            tactile_frames=tactile_frames,
-            tactile_timestamps=tactile_ts
-        )
+            # 加载相机时间戳 (作为主时间基准)
+            camera_ts = loader.load_camera_timestamps(episode_path, "main_realsense")
 
-        converter.add_episode(processed_data, meta)
+            # 计算帧索引 (基于相机时间戳)
+            T_camera = len(camera_ts)
+            frame_indices = list(range(0, T_camera - config.stride, config.stride))
+
+            video_frames = loader.load_video_frames(episode_path, frame_indices)
+            processed_data = processor.process_episode(
+                robot_data,
+                video_frames,
+                camera_timestamps=camera_ts,
+                tactile_frames=tactile_frames,
+                tactile_timestamps=tactile_ts
+            )
+
+            converter.add_episode(processed_data, meta)
+            success_count += 1
+        except Exception as e:
+            print(f"\nError processing episode {episode_path}: {e}")
+            error_count += 1
+            continue
 
     # 完成
     converter.finalize()
@@ -827,8 +1002,10 @@ def main():
     out_dir = config.output_dir / config.repo_id
     print(f"\n✓ Done! Dataset saved to: {out_dir}")
     print(f"  Action space used: {config.action_space.value}")
-    print(f"\n  Episodes converted: {len(episodes)}")
-    print(f"  Episodes skipped (incomplete tactile): {len(skipped_episodes)}")
+    print(f"\n  Episodes converted: {success_count}")
+    print(f"  Episodes failed: {error_count}")
+    if config.require_tactile:
+        print(f"  Episodes skipped (incomplete tactile): {len(skipped_episodes)}")
 
 
 if __name__ == "__main__":

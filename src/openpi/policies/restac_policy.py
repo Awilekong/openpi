@@ -39,6 +39,37 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+def _parse_tactile_image(image) -> np.ndarray:
+    """Parse tactile image to float32 (H, W, C) format, normalized to [-1, 1].
+
+    Tactile images use the same normalization as visual images: x / 255 * 2 - 1.
+
+    Handles conversion from various formats:
+    - LeRobot uint8 (H, W, C) or (C, H, W)
+    - Float32 (0-1) or (0-255) range
+    """
+    image = np.asarray(image)
+
+    # Handle CHW to HWC conversion first
+    if image.ndim == 3 and image.shape[0] == 3:
+        image = einops.rearrange(image, "c h w -> h w c")
+
+    # Convert to float32 and normalize to [-1, 1] (same as visual images)
+    if np.issubdtype(image.dtype, np.integer):
+        # uint8 [0, 255] -> float32 [-1, 1]
+        image = image.astype(np.float32) / 255.0 * 2.0 - 1.0
+    elif np.issubdtype(image.dtype, np.floating):
+        # Check if already normalized or needs scaling
+        if image.max() > 1.0:
+            # Assume [0, 255] range
+            image = image.astype(np.float32) / 255.0 * 2.0 - 1.0
+        else:
+            # Assume [0, 1] range, convert to [-1, 1]
+            image = image.astype(np.float32) * 2.0 - 1.0
+
+    return image
+
+
 def _compute_action_prev(state: np.ndarray, state_prev: np.ndarray | None) -> np.ndarray:
     """
     Compute the previous action as state_t - state_t-1.
@@ -130,8 +161,8 @@ class ResTacInputs(transforms.DataTransformFn):
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        # 4. Parse tactile image
-        tactile_image = _parse_image(data.get("observation/images/gelsight_left_rgb"))
+        # 4. Parse tactile image (normalized to [0, 1], not [-1, 1] like visual images)
+        tactile_image = _parse_tactile_image(data.get("observation/images/gelsight_left_rgb"))
 
         # Convert images to list to modify tactile position
         image_list = list(images)
@@ -232,5 +263,89 @@ class ResTacDenormalization(transforms.DataTransformFn):
                     self.norm_stats,
                     key
                 )
+
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
+class ResTacNormalizeActionPrev(transforms.DataTransformFn):
+    """
+    Normalize action_prev using the same statistics as actions.
+
+    action_prev represents the previous executed action (state_t - state_t-1),
+    which has the same distribution as actions. Therefore, we use the actions
+    normalization statistics to normalize action_prev.
+
+    Args:
+        norm_stats: Dictionary containing normalization statistics.
+                   Must have "actions" key with NormStats.
+        use_quantiles: If True, use quantile normalization (for PI05).
+                      If False, use z-score normalization (for PI0).
+    """
+    norm_stats: dict
+    use_quantiles: bool = True
+
+    def __call__(self, data: dict) -> dict:
+        if "action_prev" not in data:
+            return data
+
+        if self.norm_stats is None or "actions" not in self.norm_stats:
+            logger.warning("No 'actions' key in norm_stats, skipping action_prev normalization")
+            return data
+
+        result = dict(data)
+        action_prev = result["action_prev"]
+        stats = self.norm_stats["actions"]
+
+        if self.use_quantiles:
+            # Quantile normalization: (x - q01) / (q99 - q01) * 2 - 1 -> [-1, 1]
+            if stats.q01 is None or stats.q99 is None:
+                logger.warning("Quantile stats not available, skipping action_prev normalization")
+                return data
+            q01 = stats.q01[..., :action_prev.shape[-1]]
+            q99 = stats.q99[..., :action_prev.shape[-1]]
+            result["action_prev"] = (action_prev - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        else:
+            # Z-score normalization: (x - mean) / std
+            mean = stats.mean[..., :action_prev.shape[-1]]
+            std = stats.std[..., :action_prev.shape[-1]]
+            result["action_prev"] = (action_prev - mean) / (std + 1e-6)
+
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
+class ResTacUnnormalizeActionPrev(transforms.DataTransformFn):
+    """
+    Unnormalize action_prev using the same statistics as actions.
+
+    Args:
+        norm_stats: Dictionary containing normalization statistics.
+        use_quantiles: If True, use quantile denormalization (for PI05).
+    """
+    norm_stats: dict
+    use_quantiles: bool = True
+
+    def __call__(self, data: dict) -> dict:
+        if "action_prev" not in data:
+            return data
+
+        if self.norm_stats is None or "actions" not in self.norm_stats:
+            return data
+
+        result = dict(data)
+        action_prev = result["action_prev"]
+        stats = self.norm_stats["actions"]
+
+        if self.use_quantiles:
+            if stats.q01 is None or stats.q99 is None:
+                return data
+            q01 = stats.q01[..., :action_prev.shape[-1]]
+            q99 = stats.q99[..., :action_prev.shape[-1]]
+            result["action_prev"] = (action_prev + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+        else:
+            mean = stats.mean[..., :action_prev.shape[-1]]
+            std = stats.std[..., :action_prev.shape[-1]]
+            result["action_prev"] = action_prev * (std + 1e-6) + mean
 
         return result

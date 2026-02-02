@@ -75,14 +75,24 @@ class PaliGemmaWeightLoader(WeightLoader):
 
 @dataclasses.dataclass(frozen=True)
 class Pi0ResTacWeightLoader(WeightLoader):
-    """Loads weights from a checkpoint for ResTacVLA model.
+    """Loads weights from a checkpoint for ResTacVLA models.
 
-    Loads base Pi0/Pi05 weights and preserves new tactile-related parameters:
-    - tactile_encoder, tactile_proj: Tactile encoding modules
-    - gate (FactorizedGate): Factorized gate network (sigma_threshold, sigma_temperature, mod_mlp, mod_out)
-    - stage1_cross_attn, stage2_cross_attn: Two-stage cross-attention modules
-    - time_mlp (Pi05): Time MLP for adaRMS conditioning
-    - lora: LoRA adaptation weights
+    Loads base Pi0/Pi05 weights and preserves new tactile-related parameters.
+
+    Supported models:
+    1. Pi0_ResTac (ForceVLA-style fusion):
+       - tactile_encoder, tactile_to_vlm_proj: Tactile encoding and projection
+       - fusion_self_attn: Self-attention for ForceVLA-style fusion
+       - gate (NecessityGate): Gate network (sigma_threshold, sigma_temperature)
+
+    2. Pi0_ResTac_TokenInAE (Token injection into AE):
+       - tactile_token_proj: Projects q_event [64] to AE dimension [1024]
+       - default_tactile_embedding: Learnable default embedding for gate=0
+       - gate (NecessityGate): Gate network
+
+    Common modules:
+       - time_mlp (Pi05): Time MLP for adaRMS conditioning
+       - lora: LoRA adaptation weights
 
     Compatible with:
       trained checkpoints:
@@ -99,11 +109,17 @@ class Pi0ResTacWeightLoader(WeightLoader):
             download.maybe_download(self.params_path),
             restore_type=np.ndarray
         )
-        # Preserve new tactile-related modules, time_mlp (Pi05), and LoRA weights
+        # Preserve new tactile-related modules, fusion modules, time_mlp (Pi05), and LoRA weights
+        # - .*tactile.*: tactile_encoder, tactile_to_vlm_proj, tactile_token_proj, default_tactile_embedding
+        # - .*gate.*: NecessityGate (sigma_threshold, sigma_temperature)
+        # - .*fusion.*: fusion_self_attn (ForceVLA-style)
+        # - .*time_mlp.*: time_mlp_in, time_mlp_out (Pi05 adaRMS)
+        # - .*lora.*: LoRA adaptation weights
+        # - .*default.*embedding.*: default_tactile_embedding (Token-in-AE)
         return _merge_params(
             loaded_params,
             params,
-            missing_regex=".*lora.*|.*tactile.*|.*gate.*|.*stage.*cross_attn.*|.*time_mlp.*"
+            missing_regex=".*lora.*|.*tactile.*|.*gate.*|.*fusion.*|.*time_mlp.*|.*default.*embedding.*"
         )
 
 

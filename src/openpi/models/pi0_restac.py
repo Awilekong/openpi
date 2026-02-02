@@ -1,16 +1,15 @@
 """
-ResTacVLA: Two-Stage Cross-Attention Tactile Fusion for Vision-Language-Action Models
+ResTacVLA: ForceVLA-style Tactile Fusion for Vision-Language-Action Models
 
-This module implements the ResTacVLA architecture, which uses a two-stage cross-attention
-mechanism to fuse tactile information with visual and action features:
+This module implements the ResTacVLA architecture, which uses a ForceVLA-style fusion
+mechanism with Self-Attention and Gate to integrate tactile information:
 
-Stage 1: Tactile queries visual context (prefix_out) to understand "what was touched"
-Stage 2: Enriched tactile queries action features (suffix_out) to determine "how to correct"
+Fusion pattern: concat([prefix_out, tactile]) → Self-Attention → take_last_50 → Gate → + suffix_out
 
 Key features:
 - Self-gated sparse activation (g → 0 when no tactile event)
-- Explicit semantic understanding before action correction
-- Interpretable attention weights for visualization
+- ForceVLA-style fusion using Self-Attention instead of LIMoE
+- Gate mechanism replaces MOE expert selection
 """
 
 import dataclasses
@@ -148,6 +147,13 @@ class ResidualVQVAEWrapper(nnx.Module if TORCH_AVAILABLE else object):
             logvar = torch.zeros(B, 1, device=self.device)
         else:
             visual_pt_3views = torch.from_numpy(np.asarray(visual_3views)).float().to(self.device)
+            # Convert from [-1, 1] (SigLIP) to ImageNet normalization for VQVAE
+            # Step 1: [-1, 1] -> [0, 1]
+            visual_pt_3views = (visual_pt_3views + 1.0) / 2.0
+            # Step 2: Apply ImageNet normalization: (x - mean) / std
+            imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 1, 3, 1, 1)
+            imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 1, 3, 1, 1)
+            visual_pt_3views = (visual_pt_3views - imagenet_mean) / imagenet_std
             # Verify shape: [B, 3, 3, 224, 224]
             if visual_pt_3views.dim() == 5 and visual_pt_3views.shape[1:] == (3, 3, 224, 224):
                 # Correct format, ready for Prophet
@@ -342,153 +348,116 @@ class CrossAttentionBlock(nnx.Module):
 
 
 # =============================================================================
-# Tactile Encoder Interface (Placeholder)
+# Tactile Encoder (VQVAE-based)
 # =============================================================================
 
-class TactileEncoderPlaceholder(nnx.Module):
+class TactileEncoder(nnx.Module):
     """
-    Tactile encoder supporting both VQVAE and placeholder modes.
+    Tactile encoder using Unit-Align Residual VQVAE.
 
-    With VQVAE:
+    Requires a valid VQVAE checkpoint. Will raise an error if VQVAE is not provided.
+
+    Features:
     - q_event [B, 64] from Unit-Align VQ codebook
-    - logvar [B, 1] from Prophet network
+    - logvar [B, 1] from Prophet network (uncertainty estimation)
     - Project q_event → fusion_dim (via project_vq layer)
 
-    Placeholder mode:
-    - MLP-based features
-    - Simple sigma estimation
-
     Args:
-        output_dim: Output feature dimension (for placeholder)
-        fusion_dim: Target dimension for VQ projection (for VQVAE)
-        vqvae_wrapper: Optional ResidialVQVAEWrapper instance
+        fusion_dim: Target dimension for VQ projection
+        vqvae_wrapper: ResidualVQVAEWrapper instance (required)
         rngs: Random number generators
     """
 
-    def __init__(self, output_dim: int, fusion_dim: int = 512, vqvae_wrapper=None, rngs: nnx.Rngs = None):
-        self.output_dim = output_dim
+    def __init__(self, fusion_dim: int = 512, vqvae_wrapper=None, rngs: nnx.Rngs = None):
+        if vqvae_wrapper is None:
+            raise ValueError(
+                "TactileEncoder requires a valid VQVAE wrapper. "
+                "Please provide 'residual_vqvae_checkpoint' in Pi0_ResTacConfig."
+            )
+
         self.fusion_dim = fusion_dim
         self.vqvae_wrapper = vqvae_wrapper
 
-        # Placeholder MLP (used when vqvae_wrapper is None)
-        self.proj = nnx.Linear(224 * 224 * 3, output_dim, rngs=rngs)
-        self.sigma_proj = nnx.Linear(224 * 224 * 3, 1, rngs=rngs)
-
-        # Project VQ codes to fusion space (used when vqvae_wrapper is provided)
-        # q_event [B, 64] → [B, fusion_dim]
-        if vqvae_wrapper is not None:
-            self.project_vq = nnx.Linear(64, fusion_dim, rngs=rngs)  # 64 = Unit-Align VQ embed dim
+        # Project VQ codes to fusion space: q_event [B, 64] → [B, fusion_dim]
+        self.project_vq = nnx.Linear(64, fusion_dim, rngs=rngs)  # 64 = Unit-Align VQ embed dim
 
     def __call__(
         self,
         tactile_image: jax.Array,
-        visual_3views: jax.Array | None = None,
-        action_prev: jax.Array | None = None
+        visual_3views: jax.Array,
+        action_prev: jax.Array
     ) -> Tuple[jax.Array, jax.Array]:
         """
-        Encode tactile image to features and logvar.
-
-        VQVAE模式:
-        - q_event [B, 64] from Unit-Align VQ
-        - Project to [B, fusion_dim] via project_vq
-        - Return ([B, 1, fusion_dim], logvar)
-
-        Placeholder模式:
-        - MLP features [B, output_dim]
-        - Return ([B, 1, output_dim], logvar)
+        Encode tactile image to features and logvar using VQVAE.
 
         Args:
             tactile_image: [B, H, W, C] 触觉图像
-            visual_3views: [B, 3, 3, 224, 224] 三视角视觉图像 (VQVAE需要)
-            action_prev: [B, 7] 前一动作 (VQVAE需要)
+            visual_3views: [B, 3, 3, 224, 224] 三视角视觉图像
+            action_prev: [B, 7] 前一动作
 
         Returns:
             features: [B, 1, fusion_dim] 触觉特征 (投影后)
-            logvar: [B, 1] 不确定性
+            logvar: [B, 1] 不确定性 (来自Prophet网络)
         """
-        if self.vqvae_wrapper is not None and visual_3views is not None and action_prev is not None:
-            # Unit-Align VQVAE 模式
-            q_event_pooled, logvar = self.vqvae_wrapper(tactile_image, visual_3views, action_prev)
-            # q_event_pooled: [B, 64]
-            # Project to fusion_dim: [B, 64] → [B, fusion_dim]
-            features = self.project_vq(q_event_pooled)  # [B, fusion_dim]
-            # Reshape to [B, 1, fusion_dim] for compatibility with gate and fusion
-            features = features[:, None, :]
-            return features, logvar  # [B, 1, fusion_dim], [B, 1]
-        else:
-            # Placeholder 模式
-            batch_size = tactile_image.shape[0]
-            x = tactile_image.reshape(batch_size, -1)
-            features = self.proj(x)
-            logvar = jax.nn.softplus(self.sigma_proj(x))  # [B, 1]
-            return features[:, None, :], logvar  # [B, 1, output_dim], [B, 1]
+        # Unit-Align VQVAE encoding
+        q_event_pooled, logvar = self.vqvae_wrapper(tactile_image, visual_3views, action_prev)
+        # q_event_pooled: [B, 64]
+
+        # Project to fusion_dim: [B, 64] → [B, fusion_dim]
+        features = self.project_vq(q_event_pooled)  # [B, fusion_dim]
+
+        # Reshape to [B, 1, fusion_dim] for compatibility with gate and fusion
+        features = features[:, None, :]
+
+        return features, logvar  # [B, 1, fusion_dim], [B, 1]
 
 
 # =============================================================================
-# Factorized Gate Network
+# Necessity Gate Network
 # =============================================================================
 
-class FactorizedGate(nnx.Module):
+class NecessityGate(nnx.Module):
     """
-    Factorized Gate: g = necessity(σ) × modulation(features)
+    Necessity-based Gate: g = necessity(σ)
 
-    The gate output g is positively correlated with sigma input, while
-    the modulation network learns task-specific adjustments.
+    The gate output g is positively correlated with sigma (logvar) input.
+    Higher uncertainty (larger logvar) means tactile correction is more needed.
 
-    Components:
-    - necessity(σ) = sigmoid((σ - threshold) / temperature)
-      - Ensures g is positively correlated with sigma
-      - threshold and temperature are learnable parameters
-    - modulation(features) = sigmoid(MLP(features))
-      - Learns when to activate based on tactile content
+    Gate function:
+        g = sigmoid((σ - threshold) / temperature)
+
+    Where threshold and temperature are learnable parameters.
 
     Args:
-        tactile_dim: Dimension of tactile features
-        hidden_dim: Hidden dimension for modulation MLP
         rngs: Random number generators
     """
 
-    def __init__(
-        self,
-        tactile_dim: int,
-        hidden_dim: int = 256,
-        rngs: nnx.Rngs = None
-    ):
+    def __init__(self, rngs: nnx.Rngs = None):
         # Learnable parameters for necessity function
         # Initialize threshold to 0, temperature to 1
         self.sigma_threshold = nnx.Param(jnp.array(0.0))
         self.sigma_temperature = nnx.Param(jnp.array(1.0))
 
-        # Modulation MLP
-        self.mod_mlp = nnx.Linear(tactile_dim, hidden_dim, rngs=rngs)
-        self.mod_out = nnx.Linear(hidden_dim, 1, rngs=rngs)
-
     def __call__(
         self,
-        tactile_features: jax.Array,  # [B, tactile_dim]
+        tactile_features: jax.Array,  # [B, tactile_dim] (unused, kept for interface compatibility)
         sigma: jax.Array              # [B, 1]
     ) -> jax.Array:
         """
-        Compute factorized gate value.
+        Compute gate value based on uncertainty (sigma/logvar).
 
         Args:
-            tactile_features: Tactile features [B, tactile_dim]
-            sigma: Standard deviation from tactile encoder [B, 1]
+            tactile_features: Tactile features [B, tactile_dim] (unused)
+            sigma: Log-variance from tactile encoder [B, 1]
 
         Returns:
             g: Gate value in [0, 1], shape [B, 1]
         """
-        # Necessity: positively correlated with sigma
+        # Necessity: positively correlated with sigma (logvar)
+        # Higher logvar (more uncertainty) → higher gate value → more tactile correction
         # Use softplus to ensure positive temperature
         temp = jax.nn.softplus(self.sigma_temperature) + 1e-6
-        necessity = jax.nn.sigmoid((sigma - self.sigma_threshold) / temp)  # [B, 1]
-
-        # Modulation: learned from features
-        h = nnx.relu(self.mod_mlp(tactile_features))  # [B, hidden_dim]
-        modulation = jax.nn.sigmoid(self.mod_out(h))   # [B, 1]
-
-        # Factorized gate: g = necessity × modulation
-        g = necessity * modulation
+        g = jax.nn.sigmoid((sigma - self.sigma_threshold) / temp)  # [B, 1]
 
         return g
 
@@ -511,16 +480,19 @@ class Pi0_ResTacConfig(_model.BaseModelConfig):
     max_token_len: int = 200  # Pi05 uses 200 tokens
 
     # Tactile-specific configuration
-    tactile_encoder_dim: int = 512      # Output dim of tactile encoder (placeholder)
     fusion_dim: int = 512               # Dimension of fusion space
     num_cross_attn_heads: int = 8       # Number of attention heads
     cross_attn_dropout: float = 0.1     # Dropout rate
 
-    # Sparsity loss weight
-    sparse_loss_weight: float = 0.01
+    # Sparsity loss configuration
+    use_sparse_loss: bool = False       # Whether to add sparse loss (default: disabled)
+    sparse_loss_weight: float = 0.01    # Weight for sparse loss (only used if use_sparse_loss=True)
 
-    # Unit-Align Residual VQVAE checkpoint (optional)
-    # If provided, enables VQ code extraction and logvar from pre-trained tactile model
+    # Ablation: Gate mechanism
+    use_gate: bool = True               # Whether to use gate modulation (ablation study)
+
+    # Unit-Align Residual VQVAE checkpoint (required)
+    # Must provide a valid checkpoint path for tactile encoding
     residual_vqvae_checkpoint: str | None = None
 
     @property
@@ -627,12 +599,21 @@ def _extract_and_stack_visual_views(images_dict):
 
 class Pi0_ResTac(_model.BaseModel):
     """
-    ResTacVLA: Two-Stage Cross-Attention Tactile Fusion Model (Pi05-based).
+    ResTacVLA: ForceVLA-style Tactile Fusion Model (Pi05-based).
 
     Uses Pi05 backend with adaRMS for timestep injection.
 
-    Stage 1: Tactile Query × prefix_out (VLM) → Understand "what was touched"
-    Stage 2: Enriched tactile Query × suffix_out (Action) → Determine "how to correct"
+    Fusion pattern (ForceVLA-style):
+        concat([prefix_out, tactile]) → Self-Attention → take_last_50 → Gate → + suffix_out
+
+    Comparison with ForceVLA:
+        | Component | ForceVLA | ResTac |
+        |-----------|----------|--------|
+        | Input | prefix_out + force | prefix_out + tactile |
+        | Processing | LIMoE (Self-Attn + MOE) | Self-Attn + Gate |
+        | Take tokens | last 50 | last 50 (same) |
+        | Modulation | MOE expert selection | Gate switch |
+        | Output | + suffix_out | + suffix_out (same) |
     """
 
     def __init__(self, config: Pi0_ResTacConfig, rngs: nnx.Rngs):
@@ -680,62 +661,52 @@ class Pi0_ResTac(_model.BaseModel):
         self.time_mlp_in = nnx.Linear(self.action_dim_internal, self.action_dim_internal, rngs=rngs)
         self.time_mlp_out = nnx.Linear(self.action_dim_internal, self.action_dim_internal, rngs=rngs)
 
-        # ============ Tactile Encoder ============
-        # Load VQVAE wrapper if checkpoint is provided, otherwise use placeholder
-        vqvae_wrapper = None
-        if config.residual_vqvae_checkpoint:
-            try:
-                vqvae_wrapper = ResidualVQVAEWrapper(
-                    checkpoint_path=config.residual_vqvae_checkpoint,
-                    frozen=True
-                )
-                logger.info(f"✓ Loaded ResidualVQVAE from {config.residual_vqvae_checkpoint}")
-            except Exception as e:
-                logger.warning(f"Failed to load ResidualVQVAE: {e}. Using placeholder.")
-                vqvae_wrapper = None
+        # ============ Tactile Encoder (VQVAE-based) ============
+        # Requires a valid VQVAE checkpoint - will raise error if not provided
+        if not config.residual_vqvae_checkpoint:
+            raise ValueError(
+                "Pi0_ResTac requires 'residual_vqvae_checkpoint' in config. "
+                "Please provide a valid Unit-Align VQVAE checkpoint path."
+            )
 
-        self.tactile_encoder = TactileEncoderPlaceholder(
-            output_dim=config.tactile_encoder_dim,
+        try:
+            vqvae_wrapper = ResidualVQVAEWrapper(
+                checkpoint_path=config.residual_vqvae_checkpoint,
+                frozen=True
+            )
+            logger.info(f"Loaded ResidualVQVAE from {config.residual_vqvae_checkpoint}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load ResidualVQVAE from {config.residual_vqvae_checkpoint}: {e}"
+            )
+
+        self.tactile_encoder = TactileEncoder(
+            fusion_dim=config.fusion_dim,
             vqvae_wrapper=vqvae_wrapper,
             rngs=rngs
         )
 
-        # Tactile projection to fusion space
-        self.tactile_proj = nnx.Linear(config.tactile_encoder_dim, config.fusion_dim, rngs=rngs)
+        # ============ Necessity Gate Network ============
+        # g = necessity(σ) = sigmoid((σ - threshold) / temperature)
+        # Higher uncertainty (logvar) → higher gate value → more tactile correction
+        self.gate = NecessityGate(rngs=rngs)
 
-        # ============ Factorized Gate Network ============
-        # g = necessity(σ) × modulation(features)
-        # necessity ensures positive correlation with sigma
-        # modulation learns task-specific adjustments
-        self.gate = FactorizedGate(
-            tactile_dim=config.tactile_encoder_dim,
-            hidden_dim=256,
+        # ============ ForceVLA-style Fusion Modules ============
+        # 1. Project tactile from fusion_dim to VLM dimension
+        self.tactile_to_vlm_proj = nnx.Linear(config.fusion_dim, self.vlm_dim, rngs=rngs)
+        # fusion_dim=512 → vlm_dim=2048
+
+        # 2. Self-Attention for fusion (replaces LIMoE in ForceVLA)
+        # Input: [B, S+1, 2048] → Output: [B, S+1, 1024]
+        self.fusion_self_attn = nnx.MultiHeadAttention(
+            num_heads=config.num_cross_attn_heads,  # 8
+            in_features=self.vlm_dim,               # 2048
+            out_features=self.action_dim_internal,  # 1024
+            decode=False,
             rngs=rngs
         )
 
-        # ============ Stage 1: Cross-Attention (Tactile × VLM Context) ============
-        # Tactile as Query, visual context (prefix_out) as Key/Value
-        self.stage1_cross_attn = CrossAttentionBlock(
-            query_dim=config.fusion_dim,
-            kv_dim=self.vlm_dim,           # 2048
-            out_dim=config.fusion_dim,
-            num_heads=config.num_cross_attn_heads,
-            dropout=config.cross_attn_dropout,
-            rngs=rngs
-        )
-
-        # ============ Stage 2: Cross-Attention (Enriched Tactile × Action Features) ============
-        # Stage 1 output as Query, action features (suffix_out) as Key/Value
-        self.stage2_cross_attn = CrossAttentionBlock(
-            query_dim=config.fusion_dim,
-            kv_dim=self.action_dim_internal,   # 1024
-            out_dim=self.action_dim_internal,  # Output same as suffix_out for residual
-            num_heads=config.num_cross_attn_heads,
-            dropout=config.cross_attn_dropout,
-            rngs=rngs
-        )
-
-        logger.info(f"Pi0_ResTac initialized: vlm_dim={self.vlm_dim}, action_dim={self.action_dim_internal}, fusion_dim={self.fusion_dim}")
+        logger.info(f"Pi0_ResTac initialized (ForceVLA-style): vlm_dim={self.vlm_dim}, action_dim={self.action_dim_internal}, fusion_dim={self.fusion_dim}")
 
     # =========================================================================
     # Tactile Encoding
@@ -744,103 +715,99 @@ class Pi0_ResTac(_model.BaseModel):
     def encode_tactile(
         self,
         tactile_image: jax.Array,  # [B, H, W, C]
-        visual_3views: jax.Array | None = None,  # [B, 3, 3, 224, 224]
-        action_prev: jax.Array | None = None,    # [B, 7]
+        visual_3views: jax.Array,  # [B, 3, 3, 224, 224]
+        action_prev: jax.Array,    # [B, 7]
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """
-        Encode tactile image and compute gate value using Factorized Gate.
+        Encode tactile image and compute gate value using NecessityGate.
 
         The gate value is computed as:
-            g = necessity(logvar) × modulation(features)
+            g = necessity(logvar) = sigmoid((logvar - threshold) / temperature)
 
-        Where logvar (log-variance) indicates uncertainty (higher = less confident in visual prediction).
+        Higher logvar (more uncertainty in visual prediction) → higher gate value.
 
         Args:
             tactile_image: Tactile image [B, H, W, C]
-            visual_3views: 3-view visual [B, 3, 3, 224, 224] (optional, for VQVAE)
-            action_prev: Previous action [B, 7] (optional, for VQVAE)
+            visual_3views: 3-view visual [B, 3, 3, 224, 224]
+            action_prev: Previous action [B, 7]
 
         Returns:
             tactile_features: Features in fusion space [B, 1, fusion_dim]
             gate_value: Gate value g ∈ [0, 1], shape [B, 1]
             logvar: Log-variance (uncertainty) [B, 1]
         """
-        # 1. Encode tactile image (returns features and logvar)
-        raw_features, logvar = self.tactile_encoder(tactile_image, visual_3views, action_prev)
-        # raw_features: [B, 1, tactile_encoder_dim], logvar: [B, 1]
-        raw_features_flat = raw_features.squeeze(1)  # [B, tactile_encoder_dim]
+        # 1. Encode tactile image (returns features already in fusion_dim and logvar)
+        tactile_features, logvar = self.tactile_encoder(tactile_image, visual_3views, action_prev)
+        # tactile_features: [B, 1, fusion_dim], logvar: [B, 1]
 
-        # 2. Project to fusion space
-        tactile_features = self.tactile_proj(raw_features_flat)  # [B, fusion_dim]
-        tactile_features = tactile_features[:, None, :]  # [B, 1, fusion_dim]
-
-        # 3. Compute factorized gate value
-        # g = necessity(logvar) × modulation(features)
-        # Note: logvar is log-variance, so exp(logvar) ≈ uncertainty
-        gate_value = self.gate(raw_features_flat, logvar)  # [B, 1]
+        # 2. Compute gate value based on uncertainty (logvar)
+        # g = necessity(logvar), higher uncertainty → higher gate
+        features_flat = tactile_features.squeeze(1)  # [B, fusion_dim]
+        gate_value = self.gate(features_flat, logvar)  # [B, 1]
 
         return tactile_features, gate_value, logvar
 
     # =========================================================================
-    # Two-Stage Tactile Fusion
+    # ForceVLA-style Tactile Fusion
     # =========================================================================
 
-    def two_stage_tactile_fusion(
+    def tactile_fusion_forcevla_style(
         self,
-        tactile_features: jax.Array,   # [B, 1, fusion_dim]
-        prefix_out: jax.Array,         # [B, S_prefix, vlm_dim]
-        suffix_out: jax.Array,         # [B, S_suffix, action_dim_internal]
+        tactile_features: jax.Array,   # [B, 1, fusion_dim=512]
+        prefix_out: jax.Array,         # [B, S_prefix, vlm_dim=2048]
+        suffix_out: jax.Array,         # [B, S_suffix, action_dim_internal=1024]
         gate_value: jax.Array,         # [B, 1]
         deterministic: bool = True
     ) -> jax.Array:
         """
-        Two-stage Cross-Attention tactile fusion.
+        ForceVLA-style tactile fusion with gate instead of MOE.
 
-        Stage 1: Tactile Query × prefix_out → Semantic understanding
-        Stage 2: Enriched tactile Query × suffix_out → Action correction
+        Pattern: concat([prefix_out, tactile]) → self-attn → take_last_50 → gate → add
+
+        Data flow:
+            prefix_out [B, S, 2048]  +  tactile_proj [B, 1, 2048]
+                            │
+                            ▼ concat
+                    fused [B, S+1, 2048]
+                            │
+                            ▼ Self-Attention (replaces LIMoE)
+                    attn_out [B, S+1, 1024]
+                            │
+                            ▼ take last 50 (ForceVLA style)
+                    correction [B, 50, 1024]
+                            │
+                            ▼ × gate (replaces MOE)
+                    gated_correction [B, 50, 1024]
 
         Args:
-            tactile_features: Encoded tactile features [B, 1, fusion_dim]
-            prefix_out: VLM output (visual + language context) [B, S_prefix, vlm_dim]
-            suffix_out: Action Expert output [B, S_suffix, action_dim_internal]
+            tactile_features: Encoded tactile features [B, 1, fusion_dim=512]
+            prefix_out: VLM output (visual + language context) [B, S_prefix, vlm_dim=2048]
+            suffix_out: Action Expert output [B, S_suffix, action_dim_internal=1024]
             gate_value: Gate value g [B, 1]
             deterministic: Whether to apply dropout
 
         Returns:
             gated_correction: Gated correction [B, action_horizon, action_dim_internal]
         """
-        # ========== Stage 1: Semantic Understanding ==========
-        # Tactile asks visual context: "What did I touch?"
-        enriched_tactile, stage1_attn = self.stage1_cross_attn(
-            query=tactile_features,      # [B, 1, fusion_dim]
-            key_value=prefix_out,        # [B, S_prefix, 2048]
-            deterministic=deterministic
-        )  # [B, 1, fusion_dim]
+        # 1. Project tactile to VLM dimension
+        tactile_vlm = self.tactile_to_vlm_proj(tactile_features)  # [B, 1, 2048]
 
-        # ========== Stage 2: Action Correction ==========
-        # Extract action features (last action_horizon tokens of suffix_out)
-        action_features = suffix_out[:, -self.action_horizon:, :]  # [B, 50, 1024]
+        # 2. Concatenate [prefix_out, tactile]
+        fused = jnp.concatenate([prefix_out, tactile_vlm], axis=1)  # [B, S+1, 2048]
 
-        # Enriched tactile asks action: "How should I correct?"
-        correction, stage2_attn = self.stage2_cross_attn(
-            query=enriched_tactile,      # [B, 1, fusion_dim]
-            key_value=action_features,   # [B, 50, 1024]
-            deterministic=deterministic
-        )  # [B, 1, 1024]
+        # 3. Self-Attention (ForceVLA uses LIMoE, we use simple self-attn)
+        attn_out = self.fusion_self_attn(fused, deterministic=deterministic)
+        # [B, S+1, 1024]
 
-        # ========== Broadcast + Gate ==========
-        # Broadcast to all timesteps
-        correction = einops.repeat(
-            correction,
-            'b 1 d -> b t d',
-            t=self.action_horizon
-        )  # [B, 50, 1024]
+        # 4. Take last action_horizon tokens (ForceVLA style)
+        correction = attn_out[:, -self.action_horizon:, :]  # [B, 50, 1024]
 
-        # Apply gate
-        gate_expanded = gate_value[:, :, None]  # [B, 1, 1]
-        gated_correction = gate_expanded * correction  # [B, 50, 1024]
+        # 5. Gate (replaces MOE) - optional based on config
+        if self.config.use_gate:
+            gate_expanded = gate_value[:, :, None]  # [B, 1, 1]
+            correction = gate_expanded * correction  # [B, 50, 1024]
 
-        return gated_correction
+        return correction
 
     # =========================================================================
     # Embed Prefix (from Pi0)
@@ -1013,8 +980,8 @@ class Pi0_ResTac(_model.BaseModel):
             adarms_cond=[None, adarms_cond]  # Pi05: pass adaRMS conditioning
         )
 
-        # ============ Two-Stage Tactile Fusion ============
-        tactile_correction = self.two_stage_tactile_fusion(
+        # ============ ForceVLA-style Tactile Fusion ============
+        tactile_correction = self.tactile_fusion_forcevla_style(
             tactile_features=tactile_features,
             prefix_out=prefix_out,
             suffix_out=suffix_out,
@@ -1028,20 +995,16 @@ class Pi0_ResTac(_model.BaseModel):
         v_t = self.action_out_proj(action_out)
 
         # ============ Compute Losses ============
-        # 1. Flow Matching Loss
+        # 1. Flow Matching Loss (main loss)
         flow_loss = jnp.square(v_t - u_t)  # [B, 50, action_dim]
+        total_loss = jnp.mean(flow_loss, axis=-1)  # [B, 50]
 
-        # 2. Sparsity Loss (force g → 0)
-        # Weight by logvar uncertainty: higher logvar (lower confidence) → stronger sparse loss
-        sparse_loss = jnp.mean(gate_value)  # [B, 1] → scalar
-        logvar_mean = jnp.mean(logvar)  # scalar
-        # Use exp(logvar) as weight to amplify sparse loss when uncertainty is high
-        sparse_loss_weighted = sparse_loss * jnp.exp(logvar_mean)
-
-        # Combine losses
-        # Note: Original framework expects [B, action_horizon] shape
-        # Add sparse_loss to mean of each timestep's loss
-        total_loss = jnp.mean(flow_loss, axis=-1) + self.config.sparse_loss_weight * sparse_loss_weighted
+        # 2. Sparsity Loss (optional, disabled by default)
+        # Encourages gate to stay closed when tactile correction is not needed
+        if self.config.use_sparse_loss:
+            # gate_value: [B, 1], take mean across batch to get scalar
+            sparse_loss = jnp.mean(gate_value)
+            total_loss = total_loss + self.config.sparse_loss_weight * sparse_loss
 
         return total_loss
 
@@ -1080,17 +1043,21 @@ class Pi0_ResTac(_model.BaseModel):
 
         # Extract tactile features once (doesn't change during sampling)
         tactile_image = observation.images.get("tactile_0", None)
-        # Extract and stack 3-view visual for Prophet input: [B, 3, 3, 224, 224]
-        visual_3views = _extract_and_stack_visual_views(observation.images)
-        # For VQVAE, use action_prev from observation (previous executed action)
-        action_prev = observation.action_prev if observation.action_prev is not None else jnp.zeros((batch_size, self.action_dim))
+        if tactile_image is None:
+            raise ValueError("Pi0_ResTac requires tactile image ('tactile_0') in observation.images")
 
-        if tactile_image is not None:
-            tactile_features, gate_value, logvar = self.encode_tactile(tactile_image, visual_3views, action_prev)
-        else:
-            tactile_features = jnp.zeros((batch_size, 1, self.fusion_dim))
-            gate_value = jnp.zeros((batch_size, 1))
-            logvar = jnp.zeros((batch_size, 1))
+        # Extract and stack 3-view visual for VQVAE Prophet input: [B, 3, 3, 224, 224]
+        visual_3views = _extract_and_stack_visual_views(observation.images)
+        if visual_3views is None:
+            raise ValueError("Pi0_ResTac requires 3 visual views (base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb)")
+
+        # Get action_prev from observation (previous executed action)
+        action_prev = observation.action_prev
+        if action_prev is None:
+            raise ValueError("Pi0_ResTac requires action_prev in observation")
+
+        # Encode tactile (VQVAE-based)
+        tactile_features, gate_value, logvar = self.encode_tactile(tactile_image, visual_3views, action_prev)
 
         def step(carry):
             x_t, time = carry
@@ -1117,8 +1084,8 @@ class Pi0_ResTac(_model.BaseModel):
                 adarms_cond=[None, adarms_cond]  # Pi05: pass adaRMS conditioning
             )
 
-            # Two-stage tactile fusion
-            tactile_correction = self.two_stage_tactile_fusion(
+            # ForceVLA-style tactile fusion
+            tactile_correction = self.tactile_fusion_forcevla_style(
                 tactile_features=tactile_features,
                 prefix_out=prefix_out_cached,
                 suffix_out=suffix_out,
@@ -1128,6 +1095,554 @@ class Pi0_ResTac(_model.BaseModel):
 
             # Residual + output
             action_out = suffix_out[:, -self.action_horizon:] + tactile_correction
+            v_t = self.action_out_proj(action_out)
+
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
+
+# =============================================================================
+# Token-in-AE Configuration
+# =============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class Pi0_ResTac_TokenInAEConfig(_model.BaseModelConfig):
+    """
+    Configuration for ResTacVLA Token-in-AE variant.
+
+    This variant injects tactile information as a surprise token directly into
+    the Action Expert input, rather than using ForceVLA-style fusion.
+
+    Key differences from Pi0_ResTacConfig:
+    - Tactile token is projected to AE dimension (1024) and prepended to suffix
+    - Uses gate-based fusion: gate × tactile_token + (1-gate) × default_embedding
+    - No cross-attention or residual structure
+    """
+
+    dtype: str = "bfloat16"
+    paligemma_variant: _gemma.Variant = "gemma_2b"
+    action_expert_variant: _gemma.Variant = "gemma_300m"
+
+    # Model dimensions (Pi05 defaults)
+    action_dim: int = 32
+    action_horizon: int = 50
+    max_token_len: int = 200
+
+    # Sparsity loss configuration
+    use_sparse_loss: bool = False
+    sparse_loss_weight: float = 0.01
+
+    # Unit-Align Residual VQVAE checkpoint (required)
+    residual_vqvae_checkpoint: str | None = None
+
+    @property
+    @override
+    def model_type(self) -> _model.ModelType:
+        return _model.ModelType.PI05
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0_ResTac_TokenInAE":
+        return Pi0_ResTac_TokenInAE(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        with at.disable_typechecking():
+            observation_spec = _model.Observation(
+                images={
+                    "base_0_rgb": image_spec,
+                    "left_wrist_0_rgb": image_spec,
+                    "right_wrist_0_rgb": image_spec,
+                    "tactile_0": image_spec,
+                },
+                image_masks={
+                    "base_0_rgb": image_mask_spec,
+                    "left_wrist_0_rgb": image_mask_spec,
+                    "right_wrist_0_rgb": image_mask_spec,
+                    "tactile_0": image_mask_spec,
+                },
+                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                action_prev=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+
+        return observation_spec, action_spec
+
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Returns the freeze filter based on the model config."""
+        filters = []
+        has_lora = False
+        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+        action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+
+        if "lora" in self.paligemma_variant:
+            filters.append(gemma_params_filter)
+            if "lora" not in self.action_expert_variant:
+                filters.append(nnx.Not(action_expert_params_filter))
+            has_lora = True
+        elif "lora" in self.action_expert_variant:
+            filters.append(action_expert_params_filter)
+            has_lora = True
+
+        if has_lora:
+            filters.append(nnx.Not(nnx_utils.PathRegex(".*lora.*")))
+
+        if not filters:
+            return nnx.Nothing
+        return nnx.All(*filters)
+
+
+# =============================================================================
+# Token-in-AE Model
+# =============================================================================
+
+class Pi0_ResTac_TokenInAE(_model.BaseModel):
+    """
+    ResTacVLA Token-in-AE: Tactile Token Injection into Action Expert.
+
+    This model injects tactile information as a "surprise token" directly into
+    the Action Expert's input sequence, rather than using ForceVLA-style fusion.
+
+    Architecture:
+        1. VQVAE extracts q_event [B, 64] and logvar [B, 1] (unchanged)
+        2. NecessityGate computes gate value from logvar (unchanged)
+        3. Project q_event to AE dimension: tactile_token [B, 1, 1024]
+        4. Compute surprise token: gate × tactile_token + (1-gate) × default_embedding
+        5. Prepend surprise token to action tokens: [surprise, action_0, ..., action_49]
+        6. Action Expert processes the full sequence
+        7. Extract last action_horizon tokens as output (no residual)
+
+    Key properties:
+        - gate=1 (high uncertainty): use real tactile token
+        - gate=0 (low uncertainty): use learned default embedding (no tactile info)
+        - Surprise token is visible to all action tokens (ar_mask=False)
+    """
+
+    def __init__(self, config: Pi0_ResTac_TokenInAEConfig, rngs: nnx.Rngs):
+        super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+
+        self.config = config
+
+        # Get model configs
+        paligemma_config = _gemma.get_config(config.paligemma_variant)
+        action_expert_config = _gemma.get_config(config.action_expert_variant)
+
+        # Dimension constants
+        self.vlm_dim = paligemma_config.width           # 2048
+        self.action_dim_internal = action_expert_config.width  # 1024
+
+        # ============ PaliGemma (VLM + Image Encoder) ============
+        llm = nnx_bridge.ToNNX(
+            _gemma.Module(
+                configs=[paligemma_config, action_expert_config],
+                embed_dtype=config.dtype,
+                adarms=True,
+            )
+        )
+        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True])
+
+        img = nnx_bridge.ToNNX(
+            _siglip.Module(
+                num_classes=paligemma_config.width,
+                variant="So400m/14",
+                pool_type="none",
+                scan=True,
+                dtype_mm=config.dtype,
+            )
+        )
+        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        self.PaliGemma = nnx.Dict(llm=llm, img=img)
+
+        # ============ Action Projections ============
+        self.action_in_proj = nnx.Linear(config.action_dim, self.action_dim_internal, rngs=rngs)
+        self.action_out_proj = nnx.Linear(self.action_dim_internal, config.action_dim, rngs=rngs)
+
+        # ============ Time MLP for adaRMS (Pi05) ============
+        self.time_mlp_in = nnx.Linear(self.action_dim_internal, self.action_dim_internal, rngs=rngs)
+        self.time_mlp_out = nnx.Linear(self.action_dim_internal, self.action_dim_internal, rngs=rngs)
+
+        # ============ VQVAE Wrapper ============
+        if not config.residual_vqvae_checkpoint:
+            raise ValueError(
+                "Pi0_ResTac_TokenInAE requires 'residual_vqvae_checkpoint' in config. "
+                "Please provide a valid Unit-Align VQVAE checkpoint path."
+            )
+
+        try:
+            self.vqvae_wrapper = ResidualVQVAEWrapper(
+                checkpoint_path=config.residual_vqvae_checkpoint,
+                frozen=True
+            )
+            logger.info(f"Loaded ResidualVQVAE from {config.residual_vqvae_checkpoint}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load ResidualVQVAE from {config.residual_vqvae_checkpoint}: {e}"
+            )
+
+        # ============ Necessity Gate Network ============
+        self.gate = NecessityGate(rngs=rngs)
+
+        # ============ Token-in-AE Specific Components ============
+        # Project q_event [B, 64] → tactile_token [B, 1024]
+        self.tactile_token_proj = nnx.Linear(64, self.action_dim_internal, rngs=rngs)
+
+        # Learnable default embedding for when gate=0 (no tactile event)
+        # Initialized to zeros, will be learned during training
+        self.default_tactile_embedding = nnx.Param(
+            jnp.zeros((1, self.action_dim_internal))  # [1, 1024]
+        )
+
+        logger.info(
+            f"Pi0_ResTac_TokenInAE initialized: "
+            f"vlm_dim={self.vlm_dim}, action_dim_internal={self.action_dim_internal}"
+        )
+
+    # =========================================================================
+    # Tactile Encoding (returns raw q_event, not fusion_dim features)
+    # =========================================================================
+
+    def encode_tactile_raw(
+        self,
+        tactile_image: jax.Array,
+        visual_3views: jax.Array,
+        action_prev: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """
+        Encode tactile image and compute gate value.
+
+        Returns raw q_event (not projected) and gate value.
+
+        Args:
+            tactile_image: [B, H, W, C]
+            visual_3views: [B, 3, 3, 224, 224]
+            action_prev: [B, 7]
+
+        Returns:
+            q_event: Raw VQ event codes [B, 64]
+            gate_value: Gate value [B, 1]
+            logvar: Log-variance [B, 1]
+        """
+        # Get q_event and logvar from VQVAE
+        q_event, logvar = self.vqvae_wrapper.forward(tactile_image, visual_3views, action_prev)
+        # q_event: [B, 64], logvar: [B, 1]
+
+        # Compute gate value based on uncertainty
+        gate_value = self.gate(q_event, logvar)  # [B, 1]
+
+        return q_event, gate_value, logvar
+
+    def compute_surprise_token(
+        self,
+        q_event: jax.Array,      # [B, 64]
+        gate_value: jax.Array,   # [B, 1]
+    ) -> jax.Array:
+        """
+        Compute surprise tactile token using gate-based fusion.
+
+        Formula: surprise_token = gate × tactile_token + (1-gate) × default_embedding
+
+        Args:
+            q_event: Raw VQ event codes [B, 64]
+            gate_value: Gate value [B, 1]
+
+        Returns:
+            surprise_token: Fused tactile token [B, 1, 1024]
+        """
+        # Project q_event to AE dimension: [B, 64] → [B, 1024]
+        tactile_token = self.tactile_token_proj(q_event)  # [B, 1024]
+
+        # Get default embedding (broadcast to batch size)
+        batch_size = q_event.shape[0]
+        default_emb = jnp.broadcast_to(
+            self.default_tactile_embedding.value,  # [1, 1024]
+            (batch_size, self.action_dim_internal)  # [B, 1024]
+        )
+
+        # Gate-based fusion: gate × tactile + (1-gate) × default
+        # gate_value: [B, 1], tactile_token: [B, 1024], default_emb: [B, 1024]
+        surprise_token = gate_value * tactile_token + (1 - gate_value) * default_emb
+        # [B, 1024]
+
+        # Reshape to [B, 1, 1024] for concatenation
+        surprise_token = surprise_token[:, None, :]
+
+        return surprise_token
+
+    # =========================================================================
+    # Embed Prefix (same as Pi0_ResTac)
+    # =========================================================================
+
+    @at.typecheck
+    def embed_prefix(
+        self, obs: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        """Embed visual and language inputs (prefix)."""
+        input_mask = []
+        ar_mask = []
+        tokens = []
+
+        for name in obs.images:
+            if name == "tactile_0":
+                continue
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            tokens.append(image_tokens)
+            input_mask.append(
+                einops.repeat(
+                    obs.image_masks[name],
+                    "b -> b s",
+                    s=image_tokens.shape[1],
+                )
+            )
+            ar_mask += [False] * image_tokens.shape[1]
+
+        if obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+
+        tokens = jnp.concatenate(tokens, axis=1)
+        input_mask = jnp.concatenate(input_mask, axis=1)
+        ar_mask = jnp.array(ar_mask)
+
+        return tokens, input_mask, ar_mask
+
+    # =========================================================================
+    # Embed Suffix (Token-in-AE version)
+    # =========================================================================
+
+    def embed_suffix_with_tactile(
+        self,
+        obs: _model.Observation,
+        noisy_actions: jax.Array,
+        timestep: jax.Array,
+        surprise_token: jax.Array,  # [B, 1, 1024]
+    ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """
+        Embed suffix with surprise tactile token prepended.
+
+        Sequence: [surprise_token, action_0, action_1, ..., action_{H-1}]
+        Total length: 1 + action_horizon
+
+        Args:
+            obs: Observation
+            noisy_actions: Noisy action sequence [B, action_horizon, action_dim]
+            timestep: Diffusion timestep [B]
+            surprise_token: Tactile surprise token [B, 1, 1024]
+
+        Returns:
+            suffix_tokens: [B, 1+action_horizon, 1024]
+            suffix_mask: [B, 1+action_horizon]
+            suffix_ar_mask: [1+action_horizon]
+            adarms_cond: [B, 1024]
+        """
+        # 1. Project action tokens
+        action_tokens = self.action_in_proj(noisy_actions)  # [B, action_horizon, 1024]
+
+        # 2. Prepend surprise token
+        # suffix_tokens = [surprise_token, action_tokens]
+        suffix_tokens = jnp.concatenate([surprise_token, action_tokens], axis=1)
+        # [B, 1 + action_horizon, 1024]
+
+        # 3. Time embedding for adaRMS
+        time_emb = posemb_sincos(
+            timestep,
+            self.action_dim_internal,
+            min_period=4e-3,
+            max_period=4.0
+        )
+        time_emb = self.time_mlp_in(time_emb)
+        time_emb = nnx.swish(time_emb)
+        time_emb = self.time_mlp_out(time_emb)
+        adarms_cond = nnx.swish(time_emb)  # [B, 1024]
+
+        # 4. Build masks
+        # Input mask: all ones (all tokens are valid)
+        suffix_mask = jnp.ones((suffix_tokens.shape[0], suffix_tokens.shape[1]), dtype=jnp.bool_)
+
+        # AR mask: [False, True, False, False, ...]
+        # - surprise_token: False (bidirectional, visible to all)
+        # - first action token: True (AR)
+        # - remaining action tokens: False (bidirectional within suffix)
+        suffix_ar_mask = jnp.array(
+            [False] +  # surprise token: visible to all
+            [True] +   # first action token: AR
+            [False] * (self.action_horizon - 1)  # remaining: bidirectional
+        )
+
+        return suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond
+
+    # =========================================================================
+    # Compute Loss
+    # =========================================================================
+
+    @override
+    def compute_loss(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        """
+        Compute flow matching loss.
+
+        Returns:
+            loss: Per-timestep loss [B, action_horizon]
+        """
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+
+        # Flow matching targets
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        # ============ Extract Tactile Information ============
+        tactile_image = observation.images.get("tactile_0", None)
+        visual_3views = _extract_and_stack_visual_views(observation.images)
+        action_prev = observation.action_prev if observation.action_prev is not None else jnp.zeros((observation.state.shape[0], self.action_dim))
+
+        if tactile_image is not None:
+            q_event, gate_value, logvar = self.encode_tactile_raw(tactile_image, visual_3views, action_prev)
+            surprise_token = self.compute_surprise_token(q_event, gate_value)
+        else:
+            batch_size = observation.state.shape[0]
+            # Use default embedding when no tactile
+            surprise_token = jnp.broadcast_to(
+                self.default_tactile_embedding.value[None, :, :],
+                (batch_size, 1, self.action_dim_internal)
+            )
+            gate_value = jnp.zeros((batch_size, 1))
+
+        # ============ Encode Prefix ============
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # ============ Encode Suffix (with surprise token) ============
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix_with_tactile(
+            observation, x_t, time, surprise_token
+        )
+
+        # ============ Transformer Forward ============
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond]
+        )
+
+        # ============ Extract Action Output ============
+        # suffix_out: [B, 1+action_horizon, 1024]
+        # Take last action_horizon tokens (skip surprise token)
+        action_out = suffix_out[:, -self.action_horizon:, :]  # [B, action_horizon, 1024]
+        v_t = self.action_out_proj(action_out)  # [B, action_horizon, action_dim]
+
+        # ============ Compute Loss ============
+        flow_loss = jnp.square(v_t - u_t)
+        total_loss = jnp.mean(flow_loss, axis=-1)
+
+        # Optional sparsity loss
+        if self.config.use_sparse_loss:
+            sparse_loss = jnp.mean(gate_value)
+            total_loss = total_loss + self.config.sparse_loss_weight * sparse_loss
+
+        return total_loss
+
+    # =========================================================================
+    # Sample Actions
+    # =========================================================================
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        """Sample actions using diffusion reverse process."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # ============ Cache Prefix ============
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out_cached, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions
+        )
+
+        # ============ Compute Surprise Token (once) ============
+        tactile_image = observation.images.get("tactile_0", None)
+        if tactile_image is None:
+            raise ValueError("Pi0_ResTac_TokenInAE requires tactile image ('tactile_0')")
+
+        visual_3views = _extract_and_stack_visual_views(observation.images)
+        if visual_3views is None:
+            raise ValueError("Requires 3 visual views (base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb)")
+
+        action_prev = observation.action_prev
+        if action_prev is None:
+            raise ValueError("Requires action_prev in observation")
+
+        q_event, gate_value, logvar = self.encode_tactile_raw(tactile_image, visual_3views, action_prev)
+        surprise_token = self.compute_surprise_token(q_event, gate_value)
+        # [B, 1, 1024]
+
+        def step(carry):
+            x_t, time = carry
+
+            # Encode suffix with surprise token
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix_with_tactile(
+                observation, x_t, jnp.broadcast_to(time, batch_size), surprise_token
+            )
+
+            # Build attention mask
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_for_suffix = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_for_suffix, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            # Transformer forward
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond]
+            )
+
+            # Extract action output (last action_horizon tokens)
+            action_out = suffix_out[:, -self.action_horizon:, :]
             v_t = self.action_out_proj(action_out)
 
             return x_t + dt * v_t, time + dt
