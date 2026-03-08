@@ -40,13 +40,14 @@ def _parse_image(image) -> np.ndarray:
 
 
 def _parse_tactile_image(image) -> np.ndarray:
-    """Parse tactile image to float32 (H, W, C) format, normalized to [-1, 1].
+    """Parse tactile image to uint8 (H, W, C) format.
 
-    Tactile images use the same normalization as visual images: x / 255 * 2 - 1.
+    Keep as uint8 to be compatible with ResizeImages transform which uses PIL.
+    The model will normalize to [-1, 1] at inference time.
 
     Handles conversion from various formats:
     - LeRobot uint8 (H, W, C) or (C, H, W)
-    - Float32 (0-1) or (0-255) range
+    - Float32 (0-1) or (0-255) range -> converted back to uint8
     """
     image = np.asarray(image)
 
@@ -54,18 +55,18 @@ def _parse_tactile_image(image) -> np.ndarray:
     if image.ndim == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
 
-    # Convert to float32 and normalize to [-1, 1] (same as visual images)
-    if np.issubdtype(image.dtype, np.integer):
-        # uint8 [0, 255] -> float32 [-1, 1]
-        image = image.astype(np.float32) / 255.0 * 2.0 - 1.0
-    elif np.issubdtype(image.dtype, np.floating):
-        # Check if already normalized or needs scaling
-        if image.max() > 1.0:
-            # Assume [0, 255] range
-            image = image.astype(np.float32) / 255.0 * 2.0 - 1.0
+    # Convert to uint8 for PIL compatibility (ResizeImages uses PIL)
+    if np.issubdtype(image.dtype, np.floating):
+        # Check range and convert to uint8
+        if image.max() <= 1.0:
+            # [0, 1] range -> uint8
+            image = (image * 255).astype(np.uint8)
         else:
-            # Assume [0, 1] range, convert to [-1, 1]
-            image = image.astype(np.float32) * 2.0 - 1.0
+            # Assume [0, 255] range -> uint8
+            image = image.astype(np.uint8)
+    elif not np.issubdtype(image.dtype, np.uint8):
+        # Convert other integer types to uint8
+        image = image.astype(np.uint8)
 
     return image
 
@@ -127,24 +128,28 @@ class ResTacInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
+        # After RepackTransform, data has keys: "state", "image", "wrist_image",
+        # "handeye_image", "tactile_image", "actions", "action_prev", "prompt"
+
         # 1. Parse robot state (7D)
-        state = data.get("observation/state", np.zeros(7, dtype=np.float32))
+        state = data.get("state", np.zeros(7, dtype=np.float32))
         state = np.asarray(state, dtype=np.float32)
         if len(state) < 7:
             state = np.pad(state, (0, 7 - len(state)))
         state = transforms.pad_to_dim(state, self.action_dim)
 
         # 2. Parse action_prev (already computed in dataset as state_t - state_t-1)
+        # Keep action_prev as 7D - it's only used by VQVAE's Prophet which expects 7D
+        # No need to pad to model action_dim (32) since it doesn't go into Pi05
         action_prev = data.get("action_prev", np.zeros(7, dtype=np.float32))
         action_prev = np.asarray(action_prev, dtype=np.float32)
         if len(action_prev) < 7:
             action_prev = np.pad(action_prev, (0, 7 - len(action_prev)))
-        action_prev = transforms.pad_to_dim(action_prev, self.action_dim)
 
-        # 3. Parse visual images from the three cameras
-        main_image = _parse_image(data.get("observation/images/main_realsense_rgb"))
-        side_image = _parse_image(data.get("observation/images/side_realsense_rgb"))
-        handeye_image = _parse_image(data.get("observation/images/handeye_realsense_rgb"))
+        # 3. Parse visual images from the three cameras (using repacked keys)
+        main_image = _parse_image(data.get("image"))
+        side_image = _parse_image(data.get("wrist_image"))
+        handeye_image = _parse_image(data.get("handeye_image"))
 
         # Map images based on model type
         # For PI0 and PI05: base_0_rgb (main), left_wrist_0_rgb (handeye), right_wrist_0_rgb (side)
@@ -161,8 +166,8 @@ class ResTacInputs(transforms.DataTransformFn):
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        # 4. Parse tactile image (normalized to [0, 1], not [-1, 1] like visual images)
-        tactile_image = _parse_tactile_image(data.get("observation/images/gelsight_left_rgb"))
+        # 4. Parse tactile image (normalized to [-1, 1] like visual images)
+        tactile_image = _parse_tactile_image(data.get("tactile_image"))
 
         # Convert images to list to modify tactile position
         image_list = list(images)
@@ -178,9 +183,9 @@ class ResTacInputs(transforms.DataTransformFn):
         }
 
         # 6. Handle actions (training only)
-        # Data from LeRobot uses "action" key, but model expects "actions"
-        if "action" in data:
-            actions = np.asarray(data["action"], dtype=np.float32)
+        # Data after RepackTransform uses "actions" key
+        if "actions" in data:
+            actions = np.asarray(data["actions"], dtype=np.float32)
             if len(actions) < self.action_dim:
                 actions = np.pad(actions, (0, self.action_dim - len(actions)))
             inputs["actions"] = actions
@@ -188,9 +193,10 @@ class ResTacInputs(transforms.DataTransformFn):
         # 7. Handle prompt
         if "prompt" in data:
             # Handle bytes prompt (from RLDS datasets)
-            if isinstance(data["prompt"], bytes):
-                data["prompt"] = data["prompt"].decode("utf-8")
-            inputs["prompt"] = data["prompt"]
+            prompt = data["prompt"]
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8")
+            inputs["prompt"] = prompt
 
         return inputs
 
@@ -276,6 +282,9 @@ class ResTacNormalizeActionPrev(transforms.DataTransformFn):
     which has the same distribution as actions. Therefore, we use the actions
     normalization statistics to normalize action_prev.
 
+    Note: action_prev is kept as 7D (not padded to 32D) since it's only used
+    by VQVAE's Prophet, not by Pi05.
+
     Args:
         norm_stats: Dictionary containing normalization statistics.
                    Must have "actions" key with NormStats.
@@ -294,7 +303,7 @@ class ResTacNormalizeActionPrev(transforms.DataTransformFn):
             return data
 
         result = dict(data)
-        action_prev = result["action_prev"]
+        action_prev = np.asarray(result["action_prev"], dtype=np.float32)
         stats = self.norm_stats["actions"]
 
         if self.use_quantiles:
@@ -302,14 +311,12 @@ class ResTacNormalizeActionPrev(transforms.DataTransformFn):
             if stats.q01 is None or stats.q99 is None:
                 logger.warning("Quantile stats not available, skipping action_prev normalization")
                 return data
-            q01 = stats.q01[..., :action_prev.shape[-1]]
-            q99 = stats.q99[..., :action_prev.shape[-1]]
-            result["action_prev"] = (action_prev - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+            action_prev_normalized = (action_prev - stats.q01) / (stats.q99 - stats.q01 + 1e-6) * 2.0 - 1.0
+            result["action_prev"] = action_prev_normalized.astype(np.float32)
         else:
             # Z-score normalization: (x - mean) / std
-            mean = stats.mean[..., :action_prev.shape[-1]]
-            std = stats.std[..., :action_prev.shape[-1]]
-            result["action_prev"] = (action_prev - mean) / (std + 1e-6)
+            action_prev_normalized = (action_prev - stats.mean) / (stats.std + 1e-6)
+            result["action_prev"] = action_prev_normalized.astype(np.float32)
 
         return result
 
@@ -318,6 +325,8 @@ class ResTacNormalizeActionPrev(transforms.DataTransformFn):
 class ResTacUnnormalizeActionPrev(transforms.DataTransformFn):
     """
     Unnormalize action_prev using the same statistics as actions.
+
+    Note: action_prev is 7D (not padded), matching the actions stats dimension.
 
     Args:
         norm_stats: Dictionary containing normalization statistics.
@@ -334,18 +343,16 @@ class ResTacUnnormalizeActionPrev(transforms.DataTransformFn):
             return data
 
         result = dict(data)
-        action_prev = result["action_prev"]
+        action_prev = np.asarray(result["action_prev"], dtype=np.float32)
         stats = self.norm_stats["actions"]
 
         if self.use_quantiles:
             if stats.q01 is None or stats.q99 is None:
                 return data
-            q01 = stats.q01[..., :action_prev.shape[-1]]
-            q99 = stats.q99[..., :action_prev.shape[-1]]
-            result["action_prev"] = (action_prev + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+            action_prev_unnormalized = (action_prev + 1.0) / 2.0 * (stats.q99 - stats.q01 + 1e-6) + stats.q01
+            result["action_prev"] = action_prev_unnormalized.astype(np.float32)
         else:
-            mean = stats.mean[..., :action_prev.shape[-1]]
-            std = stats.std[..., :action_prev.shape[-1]]
-            result["action_prev"] = action_prev * (std + 1e-6) + mean
+            action_prev_unnormalized = action_prev * (stats.std + 1e-6) + stats.mean
+            result["action_prev"] = action_prev_unnormalized.astype(np.float32)
 
         return result

@@ -14,7 +14,7 @@ Key features:
 
 import dataclasses
 import logging
-from typing import Tuple
+from typing import Literal, Tuple
 import os
 import numpy as np
 
@@ -43,16 +43,310 @@ except ImportError:
 
 
 # =============================================================================
+# Global VQVAE Registry (to avoid JAX pytree issues with PyTorch modules)
+# =============================================================================
+# VQVAE wrappers are stored here instead of as model attributes because:
+# 1. JAX/NNX traces all model attributes as part of the pytree structure
+# 2. PyTorch modules have mutable state that changes between initializations
+# 3. This causes pytree structure mismatch errors during jax.jit
+# By using a global registry keyed by checkpoint path, we ensure:
+# - Same wrapper instance is reused for same checkpoint
+# - Wrapper is outside JAX's tracing scope
+_VQVAE_REGISTRY: dict[str, "ResidualVQVAEWrapper"] = {}
+
+
+def get_vqvae_wrapper(checkpoint_path: str, frozen: bool = True) -> "ResidualVQVAEWrapper":
+    """
+    Get or create a VQVAE wrapper for the given checkpoint.
+
+    Uses global registry to ensure same wrapper instance is reused,
+    avoiding JAX pytree structure mismatch issues.
+
+    Args:
+        checkpoint_path: Path to VQVAE checkpoint
+        frozen: Whether to freeze parameters
+
+    Returns:
+        ResidualVQVAEWrapper instance
+    """
+    global _VQVAE_REGISTRY
+    if checkpoint_path not in _VQVAE_REGISTRY:
+        _VQVAE_REGISTRY[checkpoint_path] = ResidualVQVAEWrapper(
+            checkpoint_path=checkpoint_path,
+            frozen=frozen
+        )
+        logger.info(f"Created new VQVAE wrapper for {checkpoint_path}")
+    return _VQVAE_REGISTRY[checkpoint_path]
+
+
+# =============================================================================
 # Unit-Align VQVAE Wrapper
 # =============================================================================
 
-class ResidualVQVAEWrapper(nnx.Module if TORCH_AVAILABLE else object):
+# =============================================================================
+# PyTorch Components for ResTac Encoder (standalone, no pytorch_lightning dependency)
+# =============================================================================
+
+class ResBlockPT(nn.Module):
+    """ResNet Block for EventEncoder."""
+    def __init__(self, channels):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+        h = self.act(self.norm2(h))
+        h = self.conv2(h)
+        return x + h
+
+
+class EventEncoderPT(nn.Module):
     """
-    Wrapper for Unit-Align's Residual VQVAE.
+    Event Encoder: (z_real, z_exp) → h_event [B, out_dim]
+
+    Standalone implementation matching ResTac's EventEncoder.
+    """
+    def __init__(self, in_channels=6, hidden_dim=64, out_dim=64):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
+            nn.GELU()
+        )
+        self.body = nn.Sequential(
+            ResBlockPT(hidden_dim),
+            ResBlockPT(hidden_dim),
+            ResBlockPT(hidden_dim)
+        )
+        self.pre_pool = nn.Conv2d(hidden_dim, out_dim, 1)
+        self.pool = nn.AdaptiveMaxPool2d(1)
+
+    def forward(self, z_real, z_exp):
+        diff = z_real - z_exp
+        x = torch.cat([z_exp, diff], dim=1)  # [B, 6, H, W]
+        h = self.head(x)
+        h = self.body(h)
+        h = self.pre_pool(h)
+        h_pooled = self.pool(h)
+        return h_pooled.squeeze(-1).squeeze(-1)  # [B, out_dim]
+
+
+class SpatialTemporalProphetPT(nn.Module):
+    """
+    SpatialTemporalProphet: visual + action → mu, logvar
+
+    Standalone implementation matching ResTac's SpatialTemporalProphet with ResNet18.
+    """
+    def __init__(self,
+                 visual_backbone: str = 'resnet18',
+                 visual_pretrained: bool = True,
+                 action_dim: int = 7,
+                 history_len: int = 1,
+                 num_views: int = 3,
+                 view_fusion: str = 'concat',
+                 latent_shape: tuple = (3, 16, 20),
+                 bottleneck_resolution: tuple = (16, 20),
+                 hidden_dims: list = None,
+                 mid_dim: int = 256,
+                 freeze_visual_backbone: bool = False,
+                 fusion_depth: int = 3,
+                 **kwargs):  # Accept extra kwargs for compatibility
+        super().__init__()
+
+        if hidden_dims is None:
+            hidden_dims = [128]
+
+        self.latent_shape = latent_shape
+        self.bottleneck_resolution = bottleneck_resolution
+        self.num_views = num_views
+        self.view_fusion = view_fusion
+
+        # Visual backbone (ResNet18)
+        import torchvision.models as models
+        if visual_backbone == 'resnet18':
+            weights = models.ResNet18_Weights.IMAGENET1K_V1 if visual_pretrained else None
+            resnet = models.resnet18(weights=weights)
+            self.visual_backbone = nn.Sequential(*list(resnet.children())[:-1])
+            base_visual_dim = 512
+
+            if freeze_visual_backbone:
+                for param in self.visual_backbone.parameters():
+                    param.requires_grad = False
+        else:
+            raise ValueError(f"Unsupported visual backbone: {visual_backbone}")
+
+        # View fusion
+        if view_fusion == 'concat':
+            self.visual_feat_dim = base_visual_dim * num_views
+        else:
+            self.visual_feat_dim = base_visual_dim
+
+        # Action MLP
+        self.action_mlp = nn.Sequential(
+            nn.Linear(action_dim, hidden_dims[0]),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+        self.action_out_dim = hidden_dims[0]
+
+        # Fusion MLP
+        self.fusion_in_dim = self.visual_feat_dim + self.action_out_dim
+        C, H_target, W_target = latent_shape
+        H_low, W_low = bottleneck_resolution
+        self.bottleneck_dim = C * H_low * W_low
+        self.mid_dim = mid_dim
+
+        # Build fusion layers
+        fusion_layers = [
+            nn.Linear(self.fusion_in_dim, mid_dim),
+            nn.LayerNorm(mid_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        ]
+        for _ in range(fusion_depth - 2):
+            fusion_layers.extend([
+                nn.Linear(mid_dim, mid_dim),
+                nn.LayerNorm(mid_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ])
+        self.fusion_body = nn.Sequential(*fusion_layers)
+
+        # Output heads
+        self.head_mu = nn.Linear(mid_dim, self.bottleneck_dim)
+        self.head_logvar = nn.Linear(mid_dim, 1)
+
+        # Upsample if needed
+        if (H_low, W_low) != (H_target, W_target):
+            self.upsample = nn.Upsample(size=(H_target, W_target), mode='bilinear', align_corners=False)
+        else:
+            self.upsample = nn.Identity()
+
+    def forward(self, visual_image, action_prev):
+        """
+        Args:
+            visual_image: [B, V, 3, H, W] multi-view visual
+            action_prev: [B, D] previous action
+        Returns:
+            mu: [B, C, H, W]
+            logvar: [B, 1]
+        """
+        if visual_image.dim() == 4:
+            visual_image = visual_image.unsqueeze(1)
+
+        B, V, C, H, W = visual_image.shape
+        v_in = visual_image.view(B * V, C, H, W)
+        v_feat = self.visual_backbone(v_in).flatten(1)  # [B*V, 512]
+        v_feat = v_feat.view(B, V, -1)
+
+        if self.view_fusion == 'concat':
+            v_feat_flat = v_feat.reshape(B, -1)
+        else:
+            v_feat_flat = v_feat.mean(dim=1)
+
+        a_feat = self.action_mlp(action_prev)
+        fused = torch.cat([v_feat_flat, a_feat], dim=1)
+        h = self.fusion_body(fused)
+
+        mu_flat = self.head_mu(h)
+        logvar = self.head_logvar(h)
+
+        C_out = self.latent_shape[0]
+        H_low, W_low = self.bottleneck_resolution
+        mu_map = mu_flat.view(B, C_out, H_low, W_low)
+        mu = self.upsample(mu_map)
+
+        return mu, logvar
+
+
+class VectorQuantizerEMA(nn.Module):
+    """
+    EMA-based Vector Quantizer matching ResTac's implementation.
+    """
+    def __init__(self, n_e: int, e_dim: int, beta: float = 0.25,
+                 use_ema: bool = True, ema_decay: float = 0.99,
+                 ema_epsilon: float = 1e-5, **kwargs):
+        super().__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+        self.use_ema = use_ema
+
+        # Embedding
+        self.register_buffer('embed', torch.randn(n_e, e_dim))
+        if use_ema:
+            self.register_buffer('cluster_size', torch.zeros(n_e))
+            self.register_buffer('embed_avg', self.embed.clone())
+            self.ema_decay = ema_decay
+            self.ema_epsilon = ema_epsilon
+
+    def forward(self, z):
+        """
+        Args:
+            z: [B, C, H, W] input
+        Returns:
+            z_q: [B, C, H, W] quantized
+            loss: commitment loss
+            info: (perplexity, min_encodings, min_encoding_indices)
+        """
+        # Reshape: [B, C, H, W] -> [B*H*W, C]
+        z_flat = z.permute(0, 2, 3, 1).contiguous()
+        z_flat = z_flat.view(-1, self.e_dim)
+
+        # Compute distances
+        d = torch.sum(z_flat ** 2, dim=1, keepdim=True) + \
+            torch.sum(self.embed ** 2, dim=1) - \
+            2 * torch.matmul(z_flat, self.embed.t())
+
+        # Find nearest embedding
+        min_encoding_indices = torch.argmin(d, dim=1)
+        z_q_flat = self.embed[min_encoding_indices]
+
+        # Compute loss
+        if self.training and self.use_ema:
+            # EMA update (not needed for frozen inference)
+            pass
+
+        # Commitment loss
+        loss = self.beta * torch.mean((z_q_flat.detach() - z_flat) ** 2)
+
+        # Straight-through estimator
+        z_q_flat = z_flat + (z_q_flat - z_flat).detach()
+
+        # Reshape back
+        B, C, H, W = z.shape
+        z_q = z_q_flat.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+        # Perplexity
+        encodings = torch.zeros(min_encoding_indices.shape[0], self.n_e, device=z.device)
+        encodings.scatter_(1, min_encoding_indices.unsqueeze(1), 1)
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        return z_q, loss, (perplexity, encodings, min_encoding_indices.view(B, H, W))
+
+
+# =============================================================================
+# ResidualVQVAEWrapper - Main Wrapper Class
+# =============================================================================
+
+class ResidualVQVAEWrapper:
+    """
+    Wrapper for ResTac's Residual VQVAE (v4 with EventEncoder).
 
     Loads a pre-trained Residual VQ-VAE checkpoint and provides:
-    - VQ codes extraction (discrete semantic event codes)
-    - Logvar extraction (uncertainty from Prophet network)
+    - q_event [B, 64]: Quantized semantic event codes from EventEncoder + VQ
+    - logvar [B, 1]: Uncertainty from Prophet network
+
+    Architecture (use_event_encoder=True mode):
+    1. SpatialTemporalProphet: (visual_3views, action_prev) → mu [B, 3, 16, 20], logvar [B, 1]
+    2. ObsEncoder + quant_conv: tactile → z_real [B, 3, 16, 20]
+    3. EventEncoder: (z_real, z_exp=mu) → h_event [B, 64]
+    4. ResidualVQ: h_event → q_event [B, 64]
     """
 
     def __init__(self, checkpoint_path: str, frozen: bool = True):
@@ -60,7 +354,7 @@ class ResidualVQVAEWrapper(nnx.Module if TORCH_AVAILABLE else object):
         Initialize VQVAE wrapper.
 
         Args:
-            checkpoint_path: Path to Unit-Align residual_vqvae checkpoint
+            checkpoint_path: Path to ResTac residual_vqvae checkpoint
             frozen: Whether to freeze all parameters (inference only)
         """
         if not TORCH_AVAILABLE:
@@ -70,142 +364,210 @@ class ResidualVQVAEWrapper(nnx.Module if TORCH_AVAILABLE else object):
         self.frozen = frozen
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Import here to avoid circular dependency
+        # Add ResTac code path to sys.path (for Encoder class)
         import sys
-        sys.path.insert(0, os.path.join(os.path.dirname(checkpoint_path), '../..'))
+        restac_path = "/home/dataset-local/code/ResTac"
+        if restac_path not in sys.path:
+            sys.path.insert(0, restac_path)
+            logger.info(f"Added ResTac path to sys.path: {restac_path}")
 
-        try:
-            from UniT.taming.models.residual_vqmodel import ResidualVQModel
-            self.model_class = ResidualVQModel
-        except ImportError:
-            raise ImportError(
-                f"Could not import ResidualVQModel from Unit-Align. "
-                f"Make sure Unit-Align is in the Python path."
-            )
-
-        self._load_checkpoint()
+        self._load_checkpoint_and_init_model()
         logger.info(f"✓ Loaded ResidualVQVAE from {checkpoint_path}")
 
-    def _load_checkpoint(self):
-        """Load checkpoint and initialize model."""
+    def _load_checkpoint_and_init_model(self):
+        """Load checkpoint and initialize model components."""
         if not os.path.exists(self.checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
 
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        # Load checkpoint
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-            hparams = checkpoint.get('hyper_parameters', {})
-        else:
-            state_dict = checkpoint
-            hparams = {}
+        if not isinstance(checkpoint, dict) or 'state_dict' not in checkpoint:
+            raise ValueError("Invalid checkpoint format: expected dict with 'state_dict' key")
 
-        # For now, we'll store the state_dict and hparams for later use
-        # Full model initialization would require more information
-        self.state_dict = state_dict
+        state_dict = checkpoint['state_dict']
+        hparams = checkpoint.get('hyper_parameters', {})
+
+        # Store hyperparameters for reference
         self.hparams = hparams
-        self.model = None  # Model will be initialized on first use
+
+        # Verify required config
+        if not hparams.get('use_event_encoder', False):
+            raise ValueError("Checkpoint does not use EventEncoder mode (use_event_encoder=False)")
+
+        # Import Encoder from ResTac (no pytorch_lightning dependency)
+        from UniT.taming.modules.diffusionmodules.model import Encoder
+
+        # Extract configs
+        ddconfig = hparams['ddconfig']
+        prophet_config = hparams['prophet_config']
+        residual_vq_config = hparams['residual_vq_config']
+
+        # Initialize components using standalone PyTorch implementations
+        # 1. Prophet: visual + action → mu, logvar
+        self.prophet_encoder = SpatialTemporalProphetPT(**prophet_config)
+
+        # 2. Observation Encoder: tactile → h_obs (from ResTac)
+        self.obs_encoder = Encoder(**ddconfig)
+
+        # 3. quant_conv: h_obs [B, z_channels, H, W] → z_real [B, latent_dim, H, W]
+        latent_dim = prophet_config['latent_shape'][0]  # 3
+        z_channels = ddconfig['z_channels']  # 3
+        self.quant_conv = nn.Conv2d(z_channels, latent_dim, kernel_size=1)
+
+        # 4. EventEncoder: (z_real, z_exp) → h_event [B, 64]
+        vq_embed_dim = residual_vq_config.get('e_dim', 64)
+        self.event_encoder = EventEncoderPT(in_channels=6, out_dim=vq_embed_dim)
+
+        # 5. ResidualVQ: h_event → q_event (use standalone VQ)
+        self.residual_vq = VectorQuantizerEMA(**residual_vq_config)
+
+        # Load state_dict into components
+        self._load_weights(state_dict)
+
+        # Move to device
+        self.prophet_encoder = self.prophet_encoder.to(self.device)
+        self.obs_encoder = self.obs_encoder.to(self.device)
+        self.quant_conv = self.quant_conv.to(self.device)
+        self.event_encoder = self.event_encoder.to(self.device)
+        self.residual_vq = self.residual_vq.to(self.device)
+
+        # Set to eval mode
+        self.prophet_encoder.eval()
+        self.obs_encoder.eval()
+        self.quant_conv.eval()
+        self.event_encoder.eval()
+        self.residual_vq.eval()
+
+        # Freeze parameters if requested
+        if self.frozen:
+            for module in [self.prophet_encoder, self.obs_encoder, self.quant_conv,
+                          self.event_encoder, self.residual_vq]:
+                for param in module.parameters():
+                    param.requires_grad = False
+            logger.info("✓ Froze all ResidualVQVAE parameters")
+
+    def _load_weights(self, state_dict):
+        """Load weights from state_dict into model components."""
+        # Helper to extract and load weights for a component
+        def load_component(component, prefix, strict=False):
+            component_sd = {k.replace(prefix, ''): v
+                          for k, v in state_dict.items() if k.startswith(prefix)}
+            if component_sd:
+                missing, unexpected = component.load_state_dict(component_sd, strict=strict)
+                if missing:
+                    logger.debug(f"  {prefix}: {len(missing)} missing keys")
+                if unexpected:
+                    logger.debug(f"  {prefix}: {len(unexpected)} unexpected keys")
+                logger.info(f"  ✓ Loaded {prefix} ({len(component_sd)} keys)")
+            else:
+                logger.warning(f"  ⚠ No weights found for {prefix}")
+
+        # Load each component
+        load_component(self.prophet_encoder, 'prophet_encoder.')
+        load_component(self.obs_encoder, 'obs_encoder.')
+        load_component(self.quant_conv, 'quant_conv.')
+        load_component(self.event_encoder, 'event_encoder.')
+        load_component(self.residual_vq, 'residual_vq.')
 
     def forward(
         self,
-        tactile_image: jnp.ndarray,  # [B, H, W, C]
+        tactile_image: jnp.ndarray,  # [B, H, W, C] HWC format from JAX
         visual_3views: jnp.ndarray | None,   # [B, 3, 3, 224, 224] 三视角
-        action_prev: jnp.ndarray     # [B, 7]
+        action_prev: jnp.ndarray     # [B, action_dim]
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Extract q_event codes and logvar from tactile observations using Unit-Align VQVAE.
+        Extract q_event codes and logvar from tactile observations.
 
-        IMPORTANT: Data format must match Unit-Align's expectations:
-        - Prophet输入: 三视角拼接视觉 [B, 3, 3, 224, 224] + action_prev [B, 7]
-        - Obs Encoder输入: tactile_image [B, 3, 128, 160]
+        Data flow:
+        1. Prophet: (visual_3views, action_prev) → mu [B, 3, 16, 20], logvar [B, 1]
+        2. ObsEncoder: tactile → z_real [B, 3, 16, 20]
+        3. EventEncoder: (z_real, mu) → h_event [B, 64]
+        4. ResidualVQ: h_event → q_event [B, 64]
 
         Args:
-            tactile_image: Tactile image [B, 128, 160, 3] (HWC format from JAX)
-            visual_3views: 3-view visual [B, 3, 3, 224, 224] (properly stacked from observation)
-            action_prev: Previous action [B, 7]
+            tactile_image: Tactile image [B, H, W, C] (HWC format from JAX, normalized to [0, 1] or [-1, 1])
+            visual_3views: 3-view visual [B, 3, 3, 224, 224] (CHW, normalized for SigLIP: [-1, 1])
+            action_prev: Previous action [B, action_dim] (only first 7 dims used)
 
         Returns:
-            q_event_pooled: Pooled VQ event codes [B, 64] (from q_event [B,64,H,W])
-            logvar: Prophet网络的log-variance [B, 1]
+            q_event: Quantized event codes [B, 64]
+            logvar: Prophet uncertainty [B, 1]
         """
         # Convert JAX arrays to PyTorch
         tactile_pt = torch.from_numpy(np.asarray(tactile_image)).float().to(self.device)
         action_pt = torch.from_numpy(np.asarray(action_prev)).float().to(self.device)
 
+        # Safety check: Prophet expects 7D action (action_prev should already be 7D)
+        prophet_action_dim = self.hparams['prophet_config']['action_dim']
+        if action_pt.shape[-1] != prophet_action_dim:
+            if action_pt.shape[-1] > prophet_action_dim:
+                action_pt = action_pt[..., :prophet_action_dim]
+            else:
+                raise ValueError(f"action_prev has {action_pt.shape[-1]} dims, expected {prophet_action_dim}")
+
         # Rearrange tactile to CHW format: [B, H, W, C] → [B, C, H, W]
         if tactile_pt.dim() == 4 and tactile_pt.shape[-1] == 3:
             tactile_pt = tactile_pt.permute(0, 3, 1, 2)  # [B, 3, 128, 160]
 
-        # Handle 3-view visual input
-        # visual_3views should be [B, 3, 3, 224, 224] (batch, num_views, channels, height, width)
+        # Normalize tactile to [-1, 1] for encoder (assuming input is [0, 1])
+        # ResTac Encoder expects [-1, 1] range
+        if tactile_pt.max() <= 1.0 and tactile_pt.min() >= 0.0:
+            tactile_pt = tactile_pt * 2.0 - 1.0
+
+        B = tactile_pt.shape[0]
+
+        # Handle visual input
         if visual_3views is None:
-            # Fallback if 3-view visual is not available
-            logger.warning("visual_3views is None in ResidualVQVAEWrapper.forward(). Using placeholder.")
-            B = tactile_pt.shape[0]
-            q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
-            logvar = torch.zeros(B, 1, device=self.device)
+            logger.warning("visual_3views is None. Using placeholder values.")
+            q_event_pt = torch.zeros(B, 64, device=self.device)
+            logvar_pt = torch.zeros(B, 1, device=self.device)
         else:
-            visual_pt_3views = torch.from_numpy(np.asarray(visual_3views)).float().to(self.device)
-            # Convert from [-1, 1] (SigLIP) to ImageNet normalization for VQVAE
+            visual_pt = torch.from_numpy(np.asarray(visual_3views)).float().to(self.device)
+
+            # Convert from SigLIP normalization [-1, 1] to ImageNet normalization
             # Step 1: [-1, 1] -> [0, 1]
-            visual_pt_3views = (visual_pt_3views + 1.0) / 2.0
+            visual_pt = (visual_pt + 1.0) / 2.0
             # Step 2: Apply ImageNet normalization: (x - mean) / std
             imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 1, 3, 1, 1)
             imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 1, 3, 1, 1)
-            visual_pt_3views = (visual_pt_3views - imagenet_mean) / imagenet_std
-            # Verify shape: [B, 3, 3, 224, 224]
-            if visual_pt_3views.dim() == 5 and visual_pt_3views.shape[1:] == (3, 3, 224, 224):
-                # Correct format, ready for Prophet
-                pass
-            else:
+            visual_pt = (visual_pt - imagenet_mean) / imagenet_std
+
+            # Verify shape
+            if visual_pt.dim() != 5 or visual_pt.shape[1:] != (3, 3, 224, 224):
                 logger.warning(
-                    f"visual_3views has unexpected shape {visual_pt_3views.shape}. "
+                    f"visual_3views has unexpected shape {visual_pt.shape}. "
                     f"Expected [B, 3, 3, 224, 224]. Using placeholder."
                 )
-                B = tactile_pt.shape[0]
-                q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
-                logvar = torch.zeros(B, 1, device=self.device)
+                q_event_pt = torch.zeros(B, 64, device=self.device)
+                logvar_pt = torch.zeros(B, 1, device=self.device)
+            else:
+                with torch.no_grad():
+                    # 1. Prophet: predict expected tactile latent
+                    mu, logvar_pt = self.prophet_encoder(visual_pt, action_pt)
+                    # mu: [B, 3, 16, 20], logvar_pt: [B, 1]
 
-        if visual_3views is not None:
-            with torch.no_grad():
-                # 准备 Unit-Align ResidualVQModel 的 batch 格式
-                batch = {
-                    'tactile_image': tactile_pt,      # [B, 3, 128, 160] - Obs Encoder 输入
-                    'visual_image': visual_pt_3views,  # [B, 3, 3, 224, 224] - Prophet 输入（三视角）
-                    'action_prev': action_pt           # [B, 7] - Prophet 输入（前一动作）
-                }
+                    # Use mu as z_exp (inference mode, no reparameterization)
+                    z_exp = mu
 
-                try:
-                    if self.model is None:
-                        logger.debug("ResidualVQVAE model not initialized. Using placeholder.")
-                        B = tactile_pt.shape[0]
-                        q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
-                        logvar = torch.zeros(B, 1, device=self.device)
-                    else:
-                        # Unit-Align ResidualVQModel forward
-                        outputs = self.model(batch)
+                    # 2. Observation Encoder: encode tactile
+                    h_obs = self.obs_encoder(tactile_pt)  # [B, z_channels, H, W]
+                    z_real = self.quant_conv(h_obs)  # [B, 3, 16, 20]
 
-                        # 提取关键输出
-                        q_event = outputs['q_event']  # [B, 64, H, W] - 量化事件表示
-                        logvar = outputs['logvar']    # [B, 1] - Prophet的不确定性
+                    # 3. EventEncoder: extract semantic event from (z_real, z_exp)
+                    h_event = self.event_encoder(z_real.detach(), z_exp)  # [B, 64]
 
-                        # q_event 池化：[B, 64, H, W] → [B, 64]
-                        # 使用平均池化
-                        B = q_event.shape[0]
-                        q_event_pooled = q_event.view(B, q_event.shape[1], -1).mean(dim=-1)  # [B, 64]
+                    # 4. ResidualVQ: quantize to discrete codes
+                    # VQ expects 4D input, reshape h_event to [B, 64, 1, 1]
+                    h_event_4d = h_event.view(B, -1, 1, 1)
+                    q_event_4d, _, _ = self.residual_vq(h_event_4d)
+                    q_event_pt = q_event_4d.squeeze(-1).squeeze(-1)  # [B, 64]
 
-                except Exception as e:
-                    logger.warning(f"Error in ResidualVQVAE forward: {e}. Using placeholder.")
-                    B = tactile_pt.shape[0]
-                    q_event_pooled = torch.ones(B, 64, device=self.device) * 0.5
-                    logvar = torch.zeros(B, 1, device=self.device)
+        # Convert back to JAX
+        q_event_jax = jnp.asarray(q_event_pt.cpu().numpy().astype(np.float32))
+        logvar_jax = jnp.asarray(logvar_pt.cpu().numpy().astype(np.float32))
 
-        # 转换回 JAX
-        q_event_pooled_jax = jnp.asarray(q_event_pooled.cpu().numpy().astype(np.float32))  # [B, 64]
-        logvar_jax = jnp.asarray(logvar.cpu().numpy().astype(np.float32))  # [B, 1]
-
-        return q_event_pooled_jax, logvar_jax
+        return q_event_jax, logvar_jax
 
 
 # =============================================================================
@@ -355,7 +717,9 @@ class TactileEncoder(nnx.Module):
     """
     Tactile encoder using Unit-Align Residual VQVAE.
 
-    Requires a valid VQVAE checkpoint. Will raise an error if VQVAE is not provided.
+    NOTE: The VQVAE wrapper (PyTorch) is NOT stored as an nnx submodule to avoid
+    JAX pytree issues. Instead, it should be passed to __call__ or stored
+    separately on the parent model.
 
     Features:
     - q_event [B, 64] from Unit-Align VQ codebook
@@ -364,45 +728,31 @@ class TactileEncoder(nnx.Module):
 
     Args:
         fusion_dim: Target dimension for VQ projection
-        vqvae_wrapper: ResidualVQVAEWrapper instance (required)
         rngs: Random number generators
     """
 
-    def __init__(self, fusion_dim: int = 512, vqvae_wrapper=None, rngs: nnx.Rngs = None):
-        if vqvae_wrapper is None:
-            raise ValueError(
-                "TactileEncoder requires a valid VQVAE wrapper. "
-                "Please provide 'residual_vqvae_checkpoint' in Pi0_ResTacConfig."
-            )
-
+    def __init__(self, fusion_dim: int = 512, rngs: nnx.Rngs = None):
         self.fusion_dim = fusion_dim
-        self.vqvae_wrapper = vqvae_wrapper
 
         # Project VQ codes to fusion space: q_event [B, 64] → [B, fusion_dim]
         self.project_vq = nnx.Linear(64, fusion_dim, rngs=rngs)  # 64 = Unit-Align VQ embed dim
 
     def __call__(
         self,
-        tactile_image: jax.Array,
-        visual_3views: jax.Array,
-        action_prev: jax.Array
+        q_event_pooled: jax.Array,  # [B, 64] - output from VQVAE wrapper
+        logvar: jax.Array,          # [B, 1] - output from VQVAE wrapper
     ) -> Tuple[jax.Array, jax.Array]:
         """
-        Encode tactile image to features and logvar using VQVAE.
+        Project q_event codes to fusion dimension.
 
         Args:
-            tactile_image: [B, H, W, C] 触觉图像
-            visual_3views: [B, 3, 3, 224, 224] 三视角视觉图像
-            action_prev: [B, 7] 前一动作
+            q_event_pooled: [B, 64] VQ event codes from VQVAE wrapper
+            logvar: [B, 1] Log-variance from VQVAE wrapper
 
         Returns:
             features: [B, 1, fusion_dim] 触觉特征 (投影后)
-            logvar: [B, 1] 不确定性 (来自Prophet网络)
+            logvar: [B, 1] 不确定性 (pass-through)
         """
-        # Unit-Align VQVAE encoding
-        q_event_pooled, logvar = self.vqvae_wrapper(tactile_image, visual_3views, action_prev)
-        # q_event_pooled: [B, 64]
-
         # Project to fusion_dim: [B, 64] → [B, fusion_dim]
         features = self.project_vq(q_event_pooled)  # [B, fusion_dim]
 
@@ -418,48 +768,100 @@ class TactileEncoder(nnx.Module):
 
 class NecessityGate(nnx.Module):
     """
-    Necessity-based Gate: g = necessity(σ)
+    Necessity-based Gate with Sensitivity Control (3-parameter version).
 
-    The gate output g is positively correlated with sigma (logvar) input.
-    Higher uncertainty (larger logvar) means tactile correction is more needed.
+    Formula: gate = clip(output_scale × sigmoid((logvar - center) × sensitivity), 0, 1)
 
-    Gate function:
-        g = sigmoid((σ - threshold) / temperature)
+    Key insight: ∂gate/∂output_scale = sigmoid(z) ≈ 0.5 (constant, never vanishes!)
 
-    Where threshold and temperature are learnable parameters.
+    The 3 parameters serve different purposes:
+    - center: shifts logvar to sigmoid's sensitive region (z≈0)
+    - sensitivity: amplifies small logvar variations (observed range is only ~0.2)
+    - output_scale: controls initial gate magnitude (starts near 0)
+
+    Args:
+        rngs: Random number generators (unused)
+    """
+
+    def __init__(self, rngs: nnx.Rngs = None):
+        # 3 parameters, each with clear purpose
+        self.logvar_center = nnx.Param(jnp.array(-9.5))    # Mean of observed logvar
+        self.sensitivity = nnx.Param(jnp.array(5.0))       # Amplify logvar variations
+        self.output_scale = nnx.Param(jnp.array(0.01))     # Initial gate ≈ 0
+
+    def __call__(
+        self,
+        tactile_features: jax.Array,  # Unused, kept for interface
+        sigma: jax.Array              # [B, 1] logvar from Prophet
+    ) -> jax.Array:
+        """
+        Compute gate with gradient-preserving architecture.
+
+        Returns:
+            gate: Value in [0, 1], shape [B, 1]
+        """
+        # 1. Normalize and amplify logvar
+        # sensitivity must be positive to maintain positive correlation
+        sens = jax.nn.softplus(self.sensitivity) + 0.1
+        z = (sigma - self.logvar_center) * sens
+        # With logvar=-9.5, center=-9.5: z = 0
+
+        # 2. Sigmoid in sensitive region (z is centered around 0)
+        s = jax.nn.sigmoid(z)
+        # s = sigmoid(0) = 0.5
+
+        # 3. Output scaling (KEY: gradient = s ≈ 0.5, never vanishes!)
+        # output_scale must be positive
+        scale = jax.nn.softplus(self.output_scale) + 1e-6
+        gate = scale * s
+        # Initial: ~0.01 × 0.5 = 0.005 ≈ 0
+
+        # 4. Clip to [0, 1]
+        gate = jnp.clip(gate, 0.0, 1.0)
+
+        return gate
+
+
+class LearnableGate(nnx.Module):
+    """
+    Fully learnable gate: gate = sigmoid(Linear(logvar))
+
+    No explicit positive correlation constraint.
+    The model learns the logvar → gate mapping entirely from data.
 
     Args:
         rngs: Random number generators
     """
 
-    def __init__(self, rngs: nnx.Rngs = None):
-        # Learnable parameters for necessity function
-        # Initialize threshold to 0, temperature to 1
-        self.sigma_threshold = nnx.Param(jnp.array(0.0))
-        self.sigma_temperature = nnx.Param(jnp.array(1.0))
+    def __init__(self, rngs: nnx.Rngs):
+        # Simple projection: [B, 1] → [B, 1]
+        # Initialize with small weights for initial gate ≈ 0.5
+        self.proj = nnx.Linear(1, 1, rngs=rngs)
 
     def __call__(
         self,
-        tactile_features: jax.Array,  # [B, tactile_dim] (unused, kept for interface compatibility)
-        sigma: jax.Array              # [B, 1]
+        tactile_features: jax.Array,  # Unused, kept for interface
+        sigma: jax.Array              # [B, 1] logvar
     ) -> jax.Array:
         """
-        Compute gate value based on uncertainty (sigma/logvar).
-
-        Args:
-            tactile_features: Tactile features [B, tactile_dim] (unused)
-            sigma: Log-variance from tactile encoder [B, 1]
+        Compute gate with learnable projection.
 
         Returns:
-            g: Gate value in [0, 1], shape [B, 1]
+            gate: Value in [0, 1], shape [B, 1]
         """
-        # Necessity: positively correlated with sigma (logvar)
-        # Higher logvar (more uncertainty) → higher gate value → more tactile correction
-        # Use softplus to ensure positive temperature
-        temp = jax.nn.softplus(self.sigma_temperature) + 1e-6
-        g = jax.nn.sigmoid((sigma - self.sigma_threshold) / temp)  # [B, 1]
+        # Direct projection + sigmoid
+        gate = jax.nn.sigmoid(self.proj(sigma))
+        return gate
 
-        return g
+
+def create_gate(gate_type: str, rngs: nnx.Rngs) -> nnx.Module:
+    """Create gate module based on gate_type config."""
+    if gate_type == "necessity":
+        return NecessityGate(rngs=rngs)
+    elif gate_type == "learnable":
+        return LearnableGate(rngs=rngs)
+    else:
+        raise ValueError(f"Unknown gate_type: {gate_type}. Use 'necessity' or 'learnable'.")
 
 
 # =============================================================================
@@ -490,6 +892,9 @@ class Pi0_ResTacConfig(_model.BaseModelConfig):
 
     # Ablation: Gate mechanism
     use_gate: bool = True               # Whether to use gate modulation (ablation study)
+
+    # Gate type selection
+    gate_type: Literal["necessity", "learnable"] = "necessity"
 
     # Unit-Align Residual VQVAE checkpoint (required)
     # Must provide a valid checkpoint path for tactile encoding
@@ -524,7 +929,7 @@ class Pi0_ResTacConfig(_model.BaseModelConfig):
                     "tactile_0": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                action_prev=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),  # Previous executed action
+                action_prev=jax.ShapeDtypeStruct([batch_size, 7], jnp.float32),  # 7D for VQVAE Prophet
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -669,27 +1074,29 @@ class Pi0_ResTac(_model.BaseModel):
                 "Please provide a valid Unit-Align VQVAE checkpoint path."
             )
 
+        # TactileEncoder only contains the projection layer (no VQVAE wrapper)
+        self.tactile_encoder = TactileEncoder(
+            fusion_dim=config.fusion_dim,
+            rngs=rngs
+        )
+
+        # IMPORTANT: VQVAE wrapper is obtained from global registry (not stored as attribute)
+        # to avoid JAX pytree structure issues with PyTorch modules.
+        # The wrapper is accessed via get_vqvae_wrapper() in encode_tactile().
+        # Verify the checkpoint can be loaded during initialization.
         try:
-            vqvae_wrapper = ResidualVQVAEWrapper(
-                checkpoint_path=config.residual_vqvae_checkpoint,
-                frozen=True
-            )
+            _ = get_vqvae_wrapper(config.residual_vqvae_checkpoint, frozen=True)
             logger.info(f"Loaded ResidualVQVAE from {config.residual_vqvae_checkpoint}")
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load ResidualVQVAE from {config.residual_vqvae_checkpoint}: {e}"
             )
+        # Store checkpoint path for use in encode_tactile (string is fine in pytree)
+        self._vqvae_checkpoint_path = config.residual_vqvae_checkpoint
 
-        self.tactile_encoder = TactileEncoder(
-            fusion_dim=config.fusion_dim,
-            vqvae_wrapper=vqvae_wrapper,
-            rngs=rngs
-        )
-
-        # ============ Necessity Gate Network ============
-        # g = necessity(σ) = sigmoid((σ - threshold) / temperature)
-        # Higher uncertainty (logvar) → higher gate value → more tactile correction
-        self.gate = NecessityGate(rngs=rngs)
+        # ============ Gate Network ============
+        # g = gate(σ), higher uncertainty (logvar) → higher gate value → more tactile correction
+        self.gate = create_gate(config.gate_type, rngs=rngs)
 
         # ============ ForceVLA-style Fusion Modules ============
         # 1. Project tactile from fusion_dim to VLM dimension
@@ -736,11 +1143,17 @@ class Pi0_ResTac(_model.BaseModel):
             gate_value: Gate value g ∈ [0, 1], shape [B, 1]
             logvar: Log-variance (uncertainty) [B, 1]
         """
-        # 1. Encode tactile image (returns features already in fusion_dim and logvar)
-        tactile_features, logvar = self.tactile_encoder(tactile_image, visual_3views, action_prev)
+        # 1. Get q_event and logvar from VQVAE wrapper (PyTorch)
+        # Use global registry to get wrapper (avoids pytree issues)
+        vqvae_wrapper = get_vqvae_wrapper(self._vqvae_checkpoint_path)
+        q_event_pooled, logvar = vqvae_wrapper.forward(tactile_image, visual_3views, action_prev)
+        # q_event_pooled: [B, 64], logvar: [B, 1]
+
+        # 2. Project q_event to fusion_dim using TactileEncoder
+        tactile_features, logvar = self.tactile_encoder(q_event_pooled, logvar)
         # tactile_features: [B, 1, fusion_dim], logvar: [B, 1]
 
-        # 2. Compute gate value based on uncertainty (logvar)
+        # 3. Compute gate value based on uncertainty (logvar)
         # g = necessity(logvar), higher uncertainty → higher gate
         features_flat = tactile_features.squeeze(1)  # [B, fusion_dim]
         gate_value = self.gate(features_flat, logvar)  # [B, 1]
@@ -1138,6 +1551,9 @@ class Pi0_ResTac_TokenInAEConfig(_model.BaseModelConfig):
     use_sparse_loss: bool = False
     sparse_loss_weight: float = 0.01
 
+    # Gate type selection
+    gate_type: Literal["necessity", "learnable"] = "necessity"
+
     # Unit-Align Residual VQVAE checkpoint (required)
     residual_vqvae_checkpoint: str | None = None
 
@@ -1170,7 +1586,7 @@ class Pi0_ResTac_TokenInAEConfig(_model.BaseModelConfig):
                     "tactile_0": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                action_prev=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                action_prev=jax.ShapeDtypeStruct([batch_size, 7], jnp.float32),  # 7D for VQVAE Prophet
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -1278,19 +1694,20 @@ class Pi0_ResTac_TokenInAE(_model.BaseModel):
                 "Please provide a valid Unit-Align VQVAE checkpoint path."
             )
 
+        # ============ Gate Network ============
+        self.gate = create_gate(config.gate_type, rngs=rngs)
+
+        # IMPORTANT: VQVAE wrapper is obtained from global registry (not stored as attribute)
+        # to avoid JAX pytree structure issues with PyTorch modules.
         try:
-            self.vqvae_wrapper = ResidualVQVAEWrapper(
-                checkpoint_path=config.residual_vqvae_checkpoint,
-                frozen=True
-            )
+            _ = get_vqvae_wrapper(config.residual_vqvae_checkpoint, frozen=True)
             logger.info(f"Loaded ResidualVQVAE from {config.residual_vqvae_checkpoint}")
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load ResidualVQVAE from {config.residual_vqvae_checkpoint}: {e}"
             )
-
-        # ============ Necessity Gate Network ============
-        self.gate = NecessityGate(rngs=rngs)
+        # Store checkpoint path for use in encode_tactile_raw (string is fine in pytree)
+        self._vqvae_checkpoint_path = config.residual_vqvae_checkpoint
 
         # ============ Token-in-AE Specific Components ============
         # Project q_event [B, 64] → tactile_token [B, 1024]
@@ -1333,7 +1750,9 @@ class Pi0_ResTac_TokenInAE(_model.BaseModel):
             logvar: Log-variance [B, 1]
         """
         # Get q_event and logvar from VQVAE
-        q_event, logvar = self.vqvae_wrapper.forward(tactile_image, visual_3views, action_prev)
+        # Use global registry to get wrapper (avoids pytree issues)
+        vqvae_wrapper = get_vqvae_wrapper(self._vqvae_checkpoint_path)
+        q_event, logvar = vqvae_wrapper.forward(tactile_image, visual_3views, action_prev)
         # q_event: [B, 64], logvar: [B, 1]
 
         # Compute gate value based on uncertainty

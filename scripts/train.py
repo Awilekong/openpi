@@ -27,6 +27,9 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+# Gate visualization for ResTac models
+RESTAC_CONFIGS = ["pi05_restac", "pi05_restac_lora", "pi05_restac_token_in_ae", "pi05_restac_token_in_ae_lora"]
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -274,6 +277,26 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+
+    # Auto-generate gate visualization for ResTac models
+    if config.name in RESTAC_CONFIGS:
+        try:
+            logging.info("Generating gate visualization videos...")
+            from scripts.visualize_gate import visualize_after_training
+            video_paths = visualize_after_training(
+                checkpoint_dir=str(config.checkpoint_dir),
+                config_name=config.name,
+                num_episodes=2,
+                fps=10,
+            )
+            if video_paths:
+                logging.info(f"Gate visualization videos saved to: {video_paths}")
+                # Log to wandb if enabled
+                if config.wandb_enabled:
+                    for path in video_paths:
+                        wandb.log({"gate_visualization": wandb.Video(path, fps=10, format="mp4")})
+        except Exception as e:
+            logging.warning(f"Failed to generate gate visualization: {e}")
 
 
 if __name__ == "__main__":

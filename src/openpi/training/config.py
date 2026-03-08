@@ -127,14 +127,16 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI05:
-                assert isinstance(model_config, pi0_config.Pi0Config)
+                # PI05 models include Pi0Config and Pi0_ResTacConfig
+                # Both have discrete_state_input attribute (Pi0_ResTacConfig uses Pi0Config's default)
+                discrete_state_input = getattr(model_config, 'discrete_state_input', False)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
+                            discrete_state_input=discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -372,7 +374,13 @@ class LeRobotResTacDataConfig(DataConfigFactory):
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
     # Key for tactile image in the dataset
-    tactile_key: str = "observation.tactile_image"
+    tactile_key: str = "observation.images.gelsight_left_rgb"
+    # Key for main RGB camera image
+    main_image_key: str = "observation.images.main_realsense_rgb"
+    # Key for wrist/side camera image
+    wrist_image_key: str = "observation.images.side_realsense_rgb"
+    # Key for handeye camera image (used as third view for Prophet)
+    handeye_image_key: str = "observation.images.handeye_realsense_rgb"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -380,15 +388,18 @@ class LeRobotResTacDataConfig(DataConfigFactory):
         base_config = self.create_base_config(assets_dirs, model_config)
 
         # Repack transform: map dataset keys to expected keys
+        # Maps to standard openpi keys that Pi0_ResTac expects
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "image": "observation.image",
-                        "wrist_image": "observation.wrist_image",
+                        "image": self.main_image_key,
+                        "wrist_image": self.wrist_image_key,
+                        "handeye_image": self.handeye_image_key,  # Third view for Prophet
                         "tactile_image": self.tactile_key,
                         "state": "observation.state",
                         "actions": "action",
+                        "action_prev": "action_prev",  # Pre-computed in dataset
                         "prompt": "prompt",
                     }
                 )
@@ -555,13 +566,13 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class LeRobotFrankaDataConfig(DataConfigFactory):
     """
     Data config for Franka single-arm robot dataset in LeRobot format.
-    
+
     This config is used to configure transforms for Franka robot data with:
     - State: 7-dim [ee_x, ee_y, ee_z, ee_rot_x, ee_rot_y, ee_rot_z, gripper]
     - Action: 7-dim EE pose delta (same as state)
     - Images: 3 cameras (main_realsense, side_realsense, handeye_realsense)
     """
-    
+
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
 
@@ -1116,15 +1127,15 @@ _CONFIGS = [
             fusion_dim=512,
             num_cross_attn_heads=8,
             use_sparse_loss=False,  # Sparse loss disabled by default
-            residual_vqvae_checkpoint="path/to/vqvae/checkpoint",  # TODO: Replace with actual checkpoint path
+            residual_vqvae_checkpoint="/home/dataset-local/code/openpi/checkpoints/checkpoint-step60000.ckpt",
         ),
         data=LeRobotResTacDataConfig(
-            repo_id="your_tactile_dataset",  # TODO: Replace with actual dataset
+            repo_id="/home/dataset-local/data/megvii_post/tac/peg_hole_tac",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.Pi0ResTacWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=50_000,
-        batch_size=4,
+        weight_loader=weight_loaders.Pi0ResTacWeightLoader("/home/dataset-local/cache/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=32,
     ),
     # LoRA fine-tuning version (low memory)
     TrainConfig(
@@ -1135,35 +1146,35 @@ _CONFIGS = [
             fusion_dim=512,
             num_cross_attn_heads=8,
             use_sparse_loss=False,  # Sparse loss disabled by default
-            residual_vqvae_checkpoint="path/to/vqvae/checkpoint",  # TODO: Replace with actual checkpoint path
+            residual_vqvae_checkpoint="/home/dataset-local/code/openpi/checkpoints/checkpoint-step60000.ckpt",
         ),
         data=LeRobotResTacDataConfig(
-            repo_id="your_tactile_dataset",  # TODO: Replace with actual dataset
+            repo_id="/home/dataset-local/data/megvii_post/tac/peg_hole_tac",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.Pi0ResTacWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.Pi0ResTacWeightLoader("/home/dataset-local/cache/openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_restac.Pi0_ResTacConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=4,
+        batch_size=32,
     ),
     # Token-in-AE variant: tactile token injected into Action Expert input
     TrainConfig(
         name="pi05_restac_token_in_ae",
         model=pi0_restac.Pi0_ResTac_TokenInAEConfig(
             use_sparse_loss=False,
-            residual_vqvae_checkpoint="path/to/vqvae/checkpoint",  # TODO: Replace with actual checkpoint path
+            residual_vqvae_checkpoint="/home/dataset-local/code/openpi/checkpoints/checkpoint-step60000.ckpt",
         ),
         data=LeRobotResTacDataConfig(
-            repo_id="your_tactile_dataset",  # TODO: Replace with actual dataset
+            repo_id="/home/dataset-local/data/megvii_post/tac/peg_hole_tac",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.Pi0ResTacWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=50_000,
-        batch_size=4,
+        weight_loader=weight_loaders.Pi0ResTacWeightLoader("/home/dataset-local/cache/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=32,
     ),
     # Token-in-AE LoRA fine-tuning version (low memory)
     TrainConfig(
@@ -1172,20 +1183,20 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_sparse_loss=False,
-            residual_vqvae_checkpoint="path/to/vqvae/checkpoint",  # TODO: Replace with actual checkpoint path
+            residual_vqvae_checkpoint="/home/dataset-local/code/openpi/checkpoints/checkpoint-step60000.ckpt",
         ),
         data=LeRobotResTacDataConfig(
-            repo_id="your_tactile_dataset",  # TODO: Replace with actual dataset
+            repo_id="/home/dataset-local/data/megvii_post/tac/peg_hole_tac",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.Pi0ResTacWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.Pi0ResTacWeightLoader("/home/dataset-local/cache/openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_restac.Pi0_ResTac_TokenInAEConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=4,
+        batch_size=32,
     ),
     #
     # Debugging configs.
